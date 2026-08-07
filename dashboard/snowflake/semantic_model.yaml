@@ -1,0 +1,164 @@
+# Cortex Analyst semantic model for ContextMesh cost telemetry.
+# Upload:  snow sql -c contextmesh -q "CREATE STAGE IF NOT EXISTS CONTEXTMESH_DB.TELEMETRY.SEMANTIC_MODELS"
+#          snow stage copy dashboard/snowflake/semantic_model.yaml @CONTEXTMESH_DB.TELEMETRY.SEMANTIC_MODELS -c contextmesh
+# Then in Snowsight: AI & ML → Cortex Analyst → point at this stage file, and ask
+# questions like "which agent role burned the most on task-05 in arm B?".
+
+name: contextmesh_telemetry
+description: >
+  Token-cost telemetry for the ContextMesh A/B experiment. Arm A0 is stock opencode with
+  prompt caching disabled, arm A is stock opencode with native Anthropic caching (the
+  headline baseline), arm B adds the ContextMesh plugin (file-read digests + result
+  compression backed by EverOS memory). Phase 'cold' is the first pass while the digest
+  store fills; 'warm' is the repeat pass where digests hit from the start. Costs are USD
+  computed from a pinned per-model rate table.
+
+tables:
+  - name: run_cost
+    description: One row per benchmark run (arm x phase x task x trial) with token totals, USD cost, and success.
+    base_table:
+      database: CONTEXTMESH_DB
+      schema: TELEMETRY
+      table: V_RUN_COST
+    dimensions:
+      - name: arm
+        expr: ARM
+        data_type: varchar
+        description: Experiment arm. A0 = no caching, A = stock baseline, B = ContextMesh.
+        sample_values: ["A0", "A", "B"]
+      - name: phase
+        expr: PHASE
+        data_type: varchar
+        description: cold = first pass (digest store filling), warm = repeat pass (store full).
+        sample_values: ["cold", "warm"]
+      - name: task_id
+        expr: TASK_ID
+        data_type: varchar
+        description: Benchmark task identifier.
+        sample_values: ["task-01", "task-05"]
+      - name: task_seq
+        expr: TASK_SEQ
+        data_type: number
+        description: Position of the task in the suite (x-axis of the falling-cost curve).
+      - name: trial
+        expr: TRIAL
+        data_type: number
+        description: Trial number 1-3.
+      - name: success
+        expr: SUCCESS
+        data_type: boolean
+        description: Whether the run passed its tests/build.
+    measures:
+      - name: total_cost_usd
+        expr: TOTAL_COST_USD
+        data_type: number
+        default_aggregation: sum
+        description: Total USD cost of the run, summarizer overhead included.
+      - name: overhead_cost_usd
+        expr: OVERHEAD_COST_USD
+        data_type: number
+        default_aggregation: sum
+        description: USD spent on ContextMesh digest summarization (the honesty overhead).
+      - name: input_tokens
+        expr: INPUT_TOKENS
+        data_type: number
+        default_aggregation: sum
+      - name: output_tokens
+        expr: OUTPUT_TOKENS
+        data_type: number
+        default_aggregation: sum
+      - name: cache_read_tokens
+        expr: CACHE_READ_TOKENS
+        data_type: number
+        default_aggregation: sum
+      - name: cache_write_tokens
+        expr: CACHE_WRITE_TOKENS
+        data_type: number
+        default_aggregation: sum
+
+  - name: subagent_attribution
+    description: Cost attributed to each session, split by agent role (orchestrator, subagent, summarizer).
+    base_table:
+      database: CONTEXTMESH_DB
+      schema: TELEMETRY
+      table: V_SUBAGENT_ATTRIBUTION
+    dimensions:
+      - name: arm
+        expr: ARM
+        data_type: varchar
+        sample_values: ["A0", "A", "B"]
+      - name: phase
+        expr: PHASE
+        data_type: varchar
+        sample_values: ["cold", "warm"]
+      - name: task_id
+        expr: TASK_ID
+        data_type: varchar
+      - name: trial
+        expr: TRIAL
+        data_type: number
+      - name: agent_role
+        expr: AGENT_ROLE
+        data_type: varchar
+        description: orchestrator (parent session), subagent (spawned worker), summarizer (ContextMesh digest generator).
+        sample_values: ["orchestrator", "subagent", "summarizer"]
+      - name: session_id
+        expr: SESSION_ID
+        data_type: varchar
+    measures:
+      - name: cost_usd
+        expr: COST_USD
+        data_type: number
+        default_aggregation: sum
+      - name: calls
+        expr: CALLS
+        data_type: number
+        default_aggregation: sum
+      - name: total_tokens
+        expr: TOTAL_TOKENS
+        data_type: number
+        default_aggregation: sum
+
+  - name: redundancy
+    description: Duplicate file-read waste and digest effectiveness per arm and phase.
+    base_table:
+      database: CONTEXTMESH_DB
+      schema: TELEMETRY
+      table: V_REDUNDANCY
+    dimensions:
+      - name: arm
+        expr: ARM
+        data_type: varchar
+        sample_values: ["A0", "A", "B"]
+      - name: phase
+        expr: PHASE
+        data_type: varchar
+        sample_values: ["cold", "warm"]
+    measures:
+      - name: total_reads
+        expr: TOTAL_READS
+        data_type: number
+        default_aggregation: sum
+      - name: duplicate_reads
+        expr: DUPLICATE_READS
+        data_type: number
+        default_aggregation: sum
+        description: File reads whose content was already read earlier in the same run.
+      - name: duplicate_served_tokens
+        expr: DUPLICATE_SERVED_TOKENS
+        data_type: number
+        default_aggregation: sum
+        description: Tokens that reached the model for duplicate reads (waste in stock arms).
+      - name: tokens_saved_by_digest
+        expr: TOKENS_SAVED_BY_DIGEST
+        data_type: number
+        default_aggregation: sum
+      - name: digest_serve_rate
+        expr: DIGEST_SERVE_RATE
+        data_type: number
+        default_aggregation: avg
+      - name: escape_hatch_rate
+        expr: ESCAPE_HATCH_RATE
+        data_type: number
+        default_aggregation: avg
+        description: Share of digest serves after which the agent re-read the raw file range.

@@ -1,0 +1,15 @@
+definition_version: 2
+entities:
+  contextmesh_dashboard:
+    type: streamlit
+    identifier:
+      name: CONTEXTMESH_DASHBOARD
+      database: CONTEXTMESH_DB
+      schema: TELEMETRY
+    stage: STREAMLIT_STAGE
+    query_warehouse: CONTEXTMESH_WH
+    main_file: streamlit_app.py
+    title: "ContextMesh Cost"
+    artifacts:
+      - streamlit_app.py
+      - environment.yml
