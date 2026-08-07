@@ -27,6 +27,20 @@ class Spec:
 
 
 @dataclass(frozen=True)
+class Template:
+    """Exact generic spec skeleton stored by RRC for later rendering."""
+
+    external_ref: str
+    spec: Spec
+    slot_names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Keep the ordered slot schema immutable even for list-like input."""
+
+        object.__setattr__(self, "slot_names", tuple(self.slot_names))
+
+
+@dataclass(frozen=True)
 class Outcome:
     """Token and verification result returned by the Lane A solve loop."""
 
