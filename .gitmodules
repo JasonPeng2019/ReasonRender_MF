@@ -1,9 +1,9 @@
 [submodule "EverOS"]
 	path = EverOS
-	url = https://github.com/EverMind-AI/EverOS.git
+	url = https://github.com/JasonPeng2019/EverOS.git
 [submodule "TokenTracker"]
 	path = TokenTracker
 	url = https://github.com/buh07/TokenTracker.git
 [submodule "opencode"]
 	path = opencode
-	url = https://github.com/sst/opencode.git
+	url = https://github.com/JasonPeng2019/opencode.git
