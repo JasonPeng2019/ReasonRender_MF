@@ -22,11 +22,14 @@ The fix attacks the dominant term directly: **the plan/contract/tests for a task
    Task
     │
     ▼
- RETRIEVE (EverOS: hybrid search over stored specs/skills, top_k=3)
+ RETRIEVE (EverOS: hybrid search over templated case content, top_k=3 → case id + similarity)
     │
-    ├── HIT  (similarity ≥ τ_reuse) ─────────────► REUSE spec verbatim   (skip expensive)
+    ▼
+ LOOKUP  (RRCv2's own store: fetch template(s) by case id — EverOS's returned content is never used directly)
+    │
+    ├── HIT  (similarity ≥ τ_reuse) ─────────────► REUSE: render template with this task's values (skip expensive)
     │                                                    │
-    ├── NEAR (τ_prime ≤ sim < τ_reuse) ──► PRIME: cheap model writes spec, neighbor(s) as few-shot
+    ├── NEAR (τ_prime ≤ sim < τ_reuse) ──► PRIME: cheap model adapts template, neighbor(s) as few-shot
     │                                                    │
     └── MISS (sim < τ_prime) ────────────► SPEC (expensive): plan+signature+contract+tests
                                                          │
@@ -38,12 +41,12 @@ The fix attacks the dominant term directly: **the plan/contract/tests for a task
                                        fail after N rounds OR reused-spec tests don't fit
                                             → ESCALATE to a fresh expensive spec (fallback)
                                                          ▼
-                                    ACCEPT → STORE spec+outcome in EverOS (seeds/reinforces skill)
+                        ACCEPT → templatize spec → STORE template (own store) + case (EverOS, seeds/reinforces skill)
                                                          ▼
                              Test-passing code  +  per-task cost logged to Snowflake
 ```
 
-The verifier is the backstop that makes retrieval safe: a stale or ill-fitting reused spec fails its tests or fails implementation, triggering escalation to a fresh expensive spec. A bad cache hit therefore costs a wasted cheap pass plus one escalation — **not a wrong answer shipped.**
+The verifier is the backstop that makes retrieval safe: a stale or ill-fitting reused spec — or a template rendered with the wrong slot values — fails its tests or fails implementation, triggering escalation to a fresh expensive spec. A bad cache hit therefore costs a wasted cheap pass plus one escalation — **not a wrong answer shipped.**
 
 ---
 
@@ -103,28 +106,48 @@ Cheapest-first — the free layers strip most junk before you spend a repair tok
 
 ## 4. EverOS integration (the amortization engine)
 
-EverOS supplies **procedural memory**: accepted specs become `agent_case` records; repeated wins are distilled offline into reusable `agent_skill`s. We read them on RETRIEVE and write them on ACCEPT.
+EverOS supplies **procedural memory**, but it is used here strictly as a *similarity index*, not as the store of record for the reusable artifact. Inside EverOS, transcript → Case fields (Task Intent/Approach/Key Insights/Quality Score) is a generative LLM step, and Case-text → embedding is a separate learned model — both non-deterministic. A `agent_skill` only exists after an offline, asynchronous cluster of successful Cases forms, so early in any workload there is nothing above the Case level to retrieve anyway. None of that is safe to depend on for a byte-exact spec, so the design splits the job: **EverOS finds the matching past task; RRCv2 owns the artifact.**
 
-**Store (on ACCEPT).** Write the task, the accepted spec, and the outcome as an agent memory, then flush so extraction runs immediately.
+**Two stores, one join key.**
+- **EverOS (`agent_case` / `agent_skill`)** — holds a *templated* spec (below) as searchable content, purely so its hybrid search (BM25 + dense vectors + rerank) matches on task shape. Read on RETRIEVE for rank/similarity only; its returned content is never treated as the artifact.
+- **RRCv2's own store** — a plain deterministic key-value store, keyed by the case/memory ID EverOS assigns on `add()`. Holds the templated spec verbatim. This is what actually gets rendered on a hit.
+
+**What "templated" means.** Before a spec is written anywhere, its instance-specific values are abstracted into named slots, so the same template can later be rendered against a different task's values. The plan, contract shape, and test *pattern* — the actual reusable structure — stay intact; only the identifier/entity/value layer is genericized. Recurring slot categories:
+- **Identifiers** — function/class name, parameter names, module/file path
+- **Types** — arg/return types, where only the entity type changes
+- **Domain entity name** — the noun the task is built around (table/resource name, error-message subject)
+- **Field/attribute lists** — the entity's fields, which drive contract clauses and tests 1:1
+- **Constants & defaults** — default values, status codes, error messages/exception types
+- **Edge-case values** — universal ones (`None`, empty string, negative int) stay fixed; domain-specific ones (e.g. "email already registered") are slots
+- **External targets** — import paths, framework boilerplate (route decorators, ORM base classes) that repeat verbatim across a workload
+- **Test assertion shape** — the pattern (`assert f(valid)==expected`, `f(invalid) raises X`) is fixed; the literal values are slots
+
+Sending the templated form (not the concrete instance) to EverOS matters for match quality: a template for "CRUD on User" should score just as similar to a new "CRUD on Order" task as to another "CRUD on User" task. Feeding the concrete instance instead lets entity-specific noise drag down exactly the matches you want.
+
+**Store (on ACCEPT).** Extract the template — slots are identified deterministically from what the spec-writer already labeled (plan/signature/contract/tests), no separate LLM pass needed — write it as the Case content so EverOS indexes on the generalized shape, capture the returned ID, then persist the same template under that ID in RRCv2's own store.
 
 ```python
 from everos_cloud import EverOS
 client = EverOS(api_key=EVEROS_API_KEY)
 m = client.v1.memories
 
-m.add(  # POST /api/v1/memories/agent
+template, slots = templatize(spec)          # deterministic, RRCv2-owned — no model call
+
+res = m.add(  # POST /api/v1/memories/agent
   user_id="rrc",                        # one agent identity for the coder
   session_id=workload_id,
   messages=[
     {"role":"user","content": task_text},
-    {"role":"assistant","content": json.dumps(spec)},   # the reusable artifact
-    {"role":"tool","content": f"verdict=pass pass@1=1 repairs={n} sig={spec['signature']}"},
+    {"role":"assistant","content": json.dumps(template)},   # templated, not instance-specific
+    {"role":"tool","content": f"verdict=pass pass@1=1 repairs={n} sig={template['signature']}"},
   ],
 )
 m.flush(user_id="rrc", session_id=workload_id)           # force extraction (async by default)
+
+spec_store.put(res.case_id, {"template": template, "slots": slots})   # RRCv2's own store, keyed by EverOS's id
 ```
 
-**Retrieve (on new task).** Hybrid search, filtered to procedural memory, task text as query.
+**Retrieve (on new task).** Hybrid search finds the matching case ID and similarity score only; the actual template is fetched from RRCv2's own store via that ID, then rendered against the new task's slot values.
 
 ```python
 res = m.search(
@@ -133,12 +156,16 @@ res = m.search(
   method="hybrid", top_k=3,
   memory_types=["agent_skill","agent_case"],
 )
-neighbors = res.data  # rank + similarity → apply thresholds below
+best = res.data[0]                                    # rank + similarity → apply thresholds below
+template = spec_store.get(best.case_id)["template"]   # never read the spec off res.data itself
+spec = render(template, extract_slot_values(task_text))  # deterministic substitution
 ```
 
-**Thresholds** (tune on your workload; start here): `τ_reuse = 0.88` (reuse verbatim), `τ_prime = 0.70` (prime a cheap spec). Below `τ_prime` → MISS → expensive spec. Prefer PRIME over REUSE whenever the retrieved signature/arg-count differs from the new task, even above τ_reuse.
+**Thresholds** (tune on your workload; start here): `τ_reuse = 0.88` (render the template deterministically, no model call), `τ_prime = 0.70` (cheap model adapts the template, neighbor(s) as few-shot). Below `τ_prime` → MISS → expensive spec, which is then templated and stored per above. Prefer PRIME over REUSE whenever the retrieved signature/arg-count differs from the new task, even above τ_reuse — rendering a template against the wrong shape is a silent failure mode the verifier has to catch.
 
-**Gotchas.** Extraction is asynchronous — always `flush`, and note a freshly stored skill may not be searchable for a beat (fine across tasks; don't rely on store→immediate-hit within one task). Use one consistent `session_id` per workload so memory doesn't fragment. Skills can rot as conventions drift; TTL/versioning is future work (§7).
+**Why not trust EverOS's Case content for the artifact.** Whatever `/memory/search` returns may be EverOS's own paraphrase of what was submitted (Task Intent/Approach are semantic abstractions written by its extraction LLM, not a guaranteed-verbatim copy), and the exact response schema for raw content isn't something this design should assume without verifying against EverOS's own API docs. Using EverOS purely as an index — ID and score, not content — makes "REUSE" mean what it says regardless of what EverOS's internal pipeline does to the text it's given.
+
+**Gotchas.** Extraction is asynchronous — always `flush`, and note a freshly stored skill may not be searchable for a beat (fine across tasks; don't rely on store→immediate-hit within one task). Use one consistent `session_id` per workload so memory doesn't fragment. Skills can rot as conventions drift; TTL/versioning is future work (§7). The join itself is a new dependency: if RRCv2's own store and EverOS's case IDs ever diverge (e.g. a store restored from an older backup than EverOS's index), RETRIEVE returns an ID with no matching template — treat that as a MISS, not an error.
 
 ---
 
@@ -238,3 +265,5 @@ Scope for ~5 hours, 1–2 people, 3-minute demo.
 - Non-reasoning spec-writer assumed for the headline; a reasoning writer on the MISS path can make cold cost exceed baseline.
 - Reuse correctness rides on test quality; adopt AgentCoder-style independent tests and re-validate reused tests against the new contract.
 - Open: right thresholds (τ_reuse, τ_prime) and repair cap N; skill TTL/versioning as conventions drift; how large a single-pass task the cheap model handles before quality collapses (where decomposition would return).
+- Open: `templatize()` reliability — deterministic slot extraction still has to correctly draw the line between structural (fixed) and instance-specific (slot) content; too aggressive and a template overfits to the original task, too conservative and irrelevant values get frozen into what should render fresh. Wrong boundaries are caught by VERIFY (a mis-rendered spec fails its tests) but cost a wasted pass.
+- Open: whether EverOS's `/memory/search` response ever needs to be read for content at all (e.g. for the PRIME few-shot exemplars) — confirm the actual response schema against EverOS's API docs rather than assuming; the design above only requires it for case ID + similarity score, which sidesteps the question, but PRIME's few-shot step may still want the neighbor template's text, which should also come from RRCv2's own store via the same ID, not from the search response.

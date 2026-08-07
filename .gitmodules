@@ -4,3 +4,6 @@
 [submodule "TokenTracker"]
 	path = TokenTracker
 	url = https://github.com/buh07/TokenTracker.git
+[submodule "opencode"]
+	path = opencode
+	url = https://github.com/sst/opencode.git
