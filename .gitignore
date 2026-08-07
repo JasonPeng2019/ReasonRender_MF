@@ -1,5 +1,18 @@
 *.codex
 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.venv/
+build/
+dist/
+.coverage
+htmlcov/
+
 # BEGIN agent-workspace managed
 .agent-workspace/
 .claude/
