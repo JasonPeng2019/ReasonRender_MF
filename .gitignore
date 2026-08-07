@@ -10,3 +10,7 @@ CLAUDE.local.md
 PLAN.md
 HANDOFF.md
 # END agent-workspace managed
+
+# Additional agent-workspace generated files
+.workspace/
+CLAUDE.local.md.pre-attach.bak
