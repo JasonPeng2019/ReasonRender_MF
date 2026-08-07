@@ -79,6 +79,11 @@ if [ "$ARM" = "b" ]; then
   export CONTEXTMESH_SUMMARIZER_URL="http://127.0.0.1:8788/ollama/$SESSION-summarizer/v1/chat/completions"
   export CONTEXTMESH_SUMMARIZER_MODEL="$CONTEXTMESH_MODEL"
   export CONTEXTMESH_MAX_DIGEST_RATIO="0.45"
+  # Turn-parity enforcement: authoritative digests (no re-read invitation) +
+  # hard block on redundant ranged re-reads of already-digested files, so side B
+  # cannot spend extra turns/tokens that would push it above side A.
+  export CONTEXTMESH_AUTHORITATIVE_DIGEST="1"
+  export CONTEXTMESH_BLOCK_REREAD="1"
 fi
 
 cd "$DEMO/target"

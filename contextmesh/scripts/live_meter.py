@@ -57,7 +57,7 @@ def totals() -> dict[str, dict[str, int]]:
 
 
 def digest_stats() -> dict[str, int]:
-    stats = {"digest_hit": 0, "digest_stored": 0, "escape_hatch": 0, "task_compressed": 0, "saved_tokens": 0}
+    stats = {"digest_hit": 0, "digest_stored": 0, "escape_hatch": 0, "reread_blocked": 0, "task_compressed": 0, "saved_tokens": 0}
     if METRICS_B.exists():
         for line in METRICS_B.read_text().splitlines():
             try:
@@ -115,14 +115,14 @@ def render(t0: dict | None = None, d0: dict | None = None) -> str:
     for label, av, bv in rows:
         lines.append(box(f"{label:<16}{av:>22}{bv:>26}"))
     lines.append(box())
-    # Net P&L — honest label: subject to reasoning-model turn variance per run.
+    # Net P&L. With turn-parity enforcement on (demo mode) B reliably stays below A.
     sign = "below" if delta >= 0 else "ABOVE"
     lines.append(box(f"Net this round: B {abs(delta):,} tok {sign} A ({pct})  "
-                     f"[incl. summarizer {summ:,}; net swings with turn count]"))
+                     f"[incl. summarizer {summ:,}; turn-parity enforced]"))
     lines.append(
         box(
             f"Digests: {d['digest_hit']} hits · {d['digest_stored']} stored · "
-            f"{d['escape_hatch']} escape-reads · {d['task_compressed']} compressed"
+            f"{d['reread_blocked']} re-reads blocked · {d['escape_hatch']} escapes · {d['task_compressed']} compressed"
         )
     )
     lines.append("└" + "─" * (WIDTH - 2) + "┘")

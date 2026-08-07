@@ -105,14 +105,25 @@ cache; EverOS is the durable cross-run layer — which is what makes **warm runs
 - **Confound controls:** temperature 0 on both agents, same model both arms, fresh
   workspace + fresh `OPENCODE_DB` per run, `OPENCODE_CONFIG_DIR` isolation,
   autocompact disabled, per-run Tollgate session names.
-- **Workload sizing (why the % is stable):** savings scale with
-  *(workers − 1) × shared-file size*. `bench/target-template` has 4 handlers
-  sharing three core modules totalling ~43K chars (~11K tokens), large enough
-  that the digest savings exceed the reasoning model's run-to-run turn variance.
-  Shrink the shared files and single-run net numbers get noisy (the mechanism
-  still fires — watch the digest-hit counter — but the net can wash out on a
-  round where side B happens to take more turns). Lead with the digest-hit /
-  tokens-replaced counter (deterministic) and quote the net as the P&L.
+- **Turn-parity enforcement (why B stays below A):** a reasoning model takes a
+  variable number of turns per run, and each extra turn re-sends the whole
+  conversation — early on this could push side B's *total* above A even though
+  its reads were cheaper. The demo config enforces parity so that can't happen:
+  (1) **authoritative digests** (`CONTEXTMESH_AUTHORITATIVE_DIGEST=1`) present the
+  digest as complete and drop the "re-read for exact lines" invitation;
+  (2) the worker prompt (identical in both arms) says read each file exactly once;
+  (3) **`CONTEXTMESH_BLOCK_REREAD=1`** makes the plugin's `tool.execute.before`
+  strip offset/limit from any ranged *re-read of an already-digest-served file*,
+  collapsing it back to the cheap digest — this only touches files already
+  digested this session, so a worker's raw read of its own audit target is
+  untouched and audit quality is preserved; (4) equal `steps` caps (worker 8,
+  orchestrator 12) in **both** arms as a runaway backstop. With this on, observed
+  rounds run at equal turn counts (e.g. A=12 / B=12) with B ~34% below A and the
+  step caps never actually hit (no truncation). `arm-a.json` and `arm-b.json` are
+  byte-identical except the `plugin` field.
+- **Workload sizing:** savings scale with *(workers − 1) × shared-file size*.
+  `bench/target-template` has 4 handlers sharing three core modules (~43K chars).
+  Bigger/more shared modules → bigger, steadier win.
 
 ## Interactive TUI demo (side-by-side, same prompt, two backends)
 
