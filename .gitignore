@@ -35,3 +35,6 @@ CLAUDE.local.md.pre-attach.bak
 # Lane B local configuration and run evidence
 /local-config/rrc/
 /runtime/rrc/
+
+# Never retain local credential scratch files.
+/creds.txt
