@@ -20,10 +20,17 @@ htmlcov/
 .generated/
 .vscode/
 CLAUDE.local.md
-PLAN.md
+/PLAN.md
 HANDOFF.md
 # END agent-workspace managed
 
 # Additional agent-workspace generated files
 .workspace/
 CLAUDE.local.md.pre-attach.bak
+
+# Local harness checkout
+/harness/
+
+# Lane B local configuration and run evidence
+/local-config/rrc/
+/runtime/rrc/

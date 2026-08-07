@@ -1,106 +1,126 @@
-# Lane B — Codex CLI, EverOS, Snowflake, Harness (ship-it-fast)
+# Lane B - Template Store, EverOS Join, and Measurement (fast)
 
-Read `RRCv2-plan.md` first. You own the three required backends + the harness + the curve. Build in requirement order: **Codex `complete` → EverOS `Memory` → run/curve (Milestone 1)**, then **Snowflake (Milestone 2)**. Test against a stub `solve` until Lane A lands.
+**Build timer started:** 2026-08-07 12:29:11 -07:00
 
-## Files (yours; nothing collides with Lane A)
+Lane B preserves the RRCv2 two-store design while cutting every feature that
+does not prove the warm-path saving. EverOS is only a similarity index. RRC
+owns the exact reusable artifact: a generic `Template` containing the complete
+templated spec skeleton and its slot schema.
+
+This fast profile intentionally overrides the family/session-id dictionary
+shortcut in `RRCv2-plan.md`. That shortcut is useful only as a throwaway demo;
+it does not preserve dynamic templates or the durable join required here.
+
+## Non-negotiable architecture
+
+```text
+accepted fresh Spec
+  -> Lane A templatize() mints external_ref
+  -> SQLite stores Template(external_ref, generic skeleton, slot names)
+  -> EverOS /add indexes the task-shape text with external_ref metadata
+  -> EverOS /flush
+
+new task
+  -> EverOS /search returns {external_ref, score}
+  -> SQLite gets the exact Template by external_ref
+  -> Lane A fills this task's slots and renders it
 ```
-rrc/model.py       # complete(): shells to `codex exec --json`, returns (text, tokens)
-rrc/memory.py      # EverOSMemory (implements Memory); LocalMemory (dev fallback only)
-rrc/everos.py      # everos_add, everos_flush, everos_search (thin HTTP)
-rrc/workload.py    # gen_workload(): repeating families with params + text + oracle tests
-rrc/run.py         # run_arm(), curve/print, main()
-rrc/sink.py        # Snowflake logging + curve SQL (Milestone 2)
+
+EverOS response content is never a spec artifact. Dynamic values are never
+stored as a rendered plan. The own store holds a single generic skeleton that
+can render many task instances.
+
+## In scope
+
+- A small EverOS `external_ref` metadata patch.
+- SQLite template storage keyed only by `Template.external_ref`.
+- `EverOSRetrieval(RetrievalPort)`: retrieve candidates, load templates, and
+  store accepted templates in the required order.
+- One `CodexModel(ModelPort)` that runs one CLI completion and captures JSONL
+  token usage. Strong and small may map to the same model for this build.
+- A repeating dynamic-slot workload, COLD/WARM runner, token curve, and
+  per-task Snowflake inserts.
+
+## Cut
+
+- PRIME, agent-case/skill tracks, OME triggers, session-id/id-capture fallback,
+  raw-template embedding, model factories, Cortex, query-tag reconciliation,
+  baseline/cascade arms, plotting polish, and a multi-agent harness.
+- Never replace the metadata patch with the family/dictionary shortcut. It
+  proves a different architecture.
+
+## Files
+
+```text
+rrc/model.py       # CodexModel: ModelPort.complete(), one JSONL completion
+rrc/store.py       # SQLite put/get of exact Template JSON by external_ref
+rrc/everos.py      # add, flush, search, health wait; response envelope parsing
+rrc/memory.py      # EverOSRetrieval: RetrievalPort join of EverOS + SQLite
+rrc/workload.py    # 12-20 interleaved tasks with RRC_SLOT_VALUES JSON
+rrc/run.py         # COLD/WARM loop, fake solve during isolated development
+rrc/sink.py        # one Snowflake row per SolveOutcome / CostEvent
+tests/lane_b/...   # fake HTTP/SQLite tests plus explicit live smoke tests
 ```
-Import only from `rrc.contract` (plus Lane A's `solve` in `run.py`, at the end).
 
-## 1) `complete()` — Codex CLI, subscription, headless
-```python
-import subprocess, json
-def complete(prompt, model):
-    cmd = ["codex","exec","--json","--skip-git-repo-check","--sandbox","read-only"]
-    if model: cmd += ["--model", model]
-    cmd += [prompt]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
-    text, tokens = "", 0
-    for line in out.splitlines():
-        try: ev = json.loads(line)
-        except: continue
-        # keep the last agent/assistant message text
-        if ev.get("type","").endswith("message") and ev.get("text"): text = ev["text"]
-        # turn.completed carries token usage
-        if ev.get("type") == "turn.completed":
-            u = ev.get("usage", {})
-            tokens = u.get("total_tokens") or (u.get("input_tokens",0)+u.get("output_tokens",0))
-    return text, tokens
-```
-- Auth: run `codex login` once (ChatGPT subscription) — no API key.
-- **Confirm the exact event names/fields with a real run** (`codex exec --json ... "say hi" | tail`); versions differ. If token parsing is flaky, fall back to `-o msg.txt` for the text + tiktoken over prompt+text (consistent across arms).
-- Two models: pass `strong`/`cheap` as `--model` (or reasoning-effort profiles). If the subscription exposes only one, use it for both.
+## The EverOS patch
 
-## 2) `EverOSMemory` — the required memory, no fork patch
-```python
-class EverOSMemory:
-    def __init__(self): self.d = {}                       # family -> Spec (the real artifact)
-    def put(self, task, spec):
-        self.d[task.family] = spec
-        everos_add(session_id=task.family, user_id="rrc", text=task.text)  # POST /add
-        everos_flush(session_id=task.family)                                # POST /flush (sync md)
-    def get(self, task):
-        hits = everos_search(user_id="rrc", query=task.text, top_k=1, min_score=TAU)  # POST /search
-        if hits and hits[0]["session_id"] in self.d:      # session_id == family (the join)
-            return self.d[hits[0]["session_id"]]
-        return None
-```
-- `everos_search` calls `/api/v2/memory/search` (method hybrid default) and returns `data.episodes` (each has `session_id`, `score`). MISS floor = `min_score=TAU` (~0.3–0.4; tune).
-- **Index lag:** a just-stored family isn't instantly searchable. Between `put` and a later dependent `get`, poll `GET /health` `cascade.pending`==0 (twice), or interleave families so recurrences aren't adjacent.
-- `LocalMemory` (dict keyed by `task.family`) is a dev fallback if EverOS is down — but Milestone 1 ships on EverOS.
+Patch the checked-out `EverOS` submodule, not the RRC client around it.
 
-## 3) `gen_workload()` — do-or-die: it MUST repeat
-```python
-def gen_workload():
-    # 2-3 families x several entities, INTERLEAVED so families recur.
-    # family="crud" over Order/User/Item...; family="parse" over csv/json...
-    # each Task: params (entity, fields), text (NL desc -> EverOS match), oracle_tests (scoring only)
-    return tasks
-```
-Flat warm curve ⇒ fix here (or lower TAU), not the pipeline.
+1. Add optional `external_ref: str | None` to `MemorizeAddRequest` in
+   `src/everos/entrypoints/api/routes/memorize.py`.
+2. Thread it through `service/memorize.py` and the existing ingest/extraction
+   persistence path without including it in model prompts.
+3. Persist it with each produced memory's frontmatter and LanceDB metadata, so
+   every memory fanned out from one `/add` carries the same ref.
+4. Add it to `SearchEpisodeItem` in `memory/search/dto.py` and populate it in
+   `memory/search/shaper.py` from candidate metadata.
+5. Add one focused EverOS test: `/add(external_ref)` then `/flush`, followed by
+   search, returns that same ref.
 
-## 4) `run.py` — Milestone 1 money shot
-```python
-def run_arm(tasks, warm, mem_factory):
-    mem = mem_factory()
-    return [solve(t, warm=warm, complete=complete, memory=mem, strong=STRONG, cheap=CHEAP)
-            for t in tasks]
+The RRC run sends `external_ref` on `/add`. A search hit without a non-empty
+ref is ignored as a MISS. Lane B never invents an alternate ID.
 
-def main():
-    tasks = gen_workload()
-    cold = run_arm(tasks, warm=False, mem_factory=NoMemory)
-    warm = run_arm(tasks, warm=True,  mem_factory=EverOSMemory)
-    report(cold, warm)         # running mean tokens/passed vs task order; matplotlib or CSV+print
-    log_to_snowflake(cold+warm)  # Milestone 2
-```
-Count every token (spec+impl+repair). Hit = `reused and passed`.
+## Store and retrieve
 
-## 5) `sink.py` — Snowflake cost-of-record (Milestone 2)
-```python
-# CREATE TABLE rrc_runs(seq int autoincrement, task_id string, arm string, reused boolean,
-#   spec_tokens int, impl_tokens int, repair_tokens int, total_tokens int, passed boolean, ts timestamp);
-def log_to_snowflake(outcomes):
-    # INSERT one row per outcome (snowflake-connector-python; executemany)
-    ...
-# Curve in SQL (the demo query):
-# SELECT arm, seq,
-#        AVG(total_tokens) OVER (PARTITION BY arm ORDER BY seq
-#              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_mean_tokens
-# FROM rrc_runs WHERE passed ORDER BY arm, seq;
-```
-De-scope: if SQL curve is tight on time, just `INSERT` (Snowflake requirement met) and plot in Python.
+`store(task, template, outcome)` does this exact sequence:
 
-## Cut (don't build)
-Codex query-tags/account-usage reconciliation (Codex `turn.completed` is the meter); EverOS fork patch / external_ref / OME trigger; PRIME; baseline & cascade arms; plotting polish; workload realism beyond "it repeats."
+1. Write the canonical `Template` JSON to SQLite under `template.external_ref`.
+2. Send one user episode containing the task-shape text and `external_ref`.
+3. Flush the EverOS session.
 
-## Self-test (no Lane A)
-Stub `solve = lambda **k: Outcome(k["task"].task_id, k["warm"], True, seen_before, 0 if seen_before else 800, 200, 0)`. Verify `run_arm` sums tokens, cold mean > warm mean, warm falls over task order. Separately: `complete("say only: PING","")` returns non-empty text + tokens>0; `EverOSMemory` round-trips put→(wait)→get against a running EverOS.
+If the EverOS write fails after SQLite succeeds, leave the template in SQLite;
+later lookup simply misses until EverOS has an index entry. Do not delete the
+template and do not report a false success for the index write.
 
-## Merge
-Swap the stub `solve` for Lane A's real `solve` in `run.py`. Everything else unchanged.
+`retrieve(task, cfg)` searches the episode track with fixed owner/scope,
+`method="hybrid"`, `top_k=cfg.top_k`, and `min_score=cfg.tau_floor`. It returns
+only `Candidate(external_ref, score)` values. `get_template(ref)` reads SQLite.
+A stale EverOS hit whose SQLite row is absent is a normal MISS.
+
+Before a just-written template is expected to hit, poll `/health` until
+`cascade.pending == 0` twice. The workload interleaves families so the demo
+does not depend on an immediate post-write hit.
+
+## Fast implementation order
+
+1. Confirm `codex exec --json` produces final text plus `turn.completed` usage.
+2. Implement and test SQLite template round trips using real `Template` values.
+3. Implement the EverOS patch and prove the external-ref round trip against the
+   local server.
+4. Implement `EverOSRetrieval` with fake HTTP tests, then its live smoke test.
+5. Generate a small structured dynamic-slot workload and run COLD/WARM through
+   an injected fake `solve`.
+6. Wire in Lane A's real `solve`, record every `CostEvent`, and insert outcome
+   rows into Snowflake.
+
+At two hours, cut all optional work. At three hours, the required MVP is a
+real EverOS search returning a ref, SQLite returning its template, and Lane A
+reusing it with new slot values. The final hour is Snowflake inserts and a
+measured cold-versus-warm report.
+
+## Completion gate
+
+Lane B is ready when a real EverOS search returns the patched `external_ref`,
+SQLite returns the exact generic template, the same template renders two task
+instances with different slot values, and the WARM run records no SPEC call on
+the second instance. Snowflake must receive the per-task token and pass fields.

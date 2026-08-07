@@ -7,3 +7,6 @@
 [submodule "opencode"]
 	path = opencode
 	url = https://github.com/JasonPeng2019/opencode.git
+[submodule "harness"]
+	path = harness
+	url = https://github.com/JasonPeng2019/harness-single.git
