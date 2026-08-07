@@ -30,6 +30,7 @@ CLAUDE.local.md.pre-attach.bak
 
 # Local harness checkout
 /harness/
+/harness-irrelevant/
 
 # Lane B local configuration and run evidence
 /local-config/rrc/
