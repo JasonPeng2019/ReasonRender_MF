@@ -1,0 +1,6 @@
+[submodule "EverOS"]
+	path = EverOS
+	url = https://github.com/EverMind-AI/EverOS.git
+[submodule "TokenTracker"]
+	path = TokenTracker
+	url = https://github.com/buh07/TokenTracker.git
