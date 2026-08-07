@@ -1,0 +1,70 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama/deepseek-v4-flash:cloud",
+  "default_agent": "orchestrator",
+  "share": "disabled",
+  "subagent_depth": 1,
+  "lsp": {
+    "typescript": {
+      "disabled": true
+    },
+    "eslint": {
+      "disabled": true
+    },
+    "oxlint": {
+      "disabled": true
+    },
+    "biome": {
+      "disabled": true
+    },
+    "deno": {
+      "disabled": true
+    }
+  },
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama Cloud",
+      "options": {
+        "baseURL": "{env:CONTEXTMESH_PROXY_BASE}",
+        "apiKey": "{env:OLLAMA_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash:cloud": {
+          "name": "DeepSeek V4 Flash (cloud)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "orchestrator": {
+      "mode": "primary",
+      "temperature": 0,
+      "description": "Coordinates multi-file work by delegating to worker subagents.",
+      "permission": {
+        "edit": "deny"
+      },
+      "prompt": "You are the ORCHESTRATOR. You coordinate work by delegating to worker subagents; you never read or edit source files yourself.\n\nFor the given audit task:\n1. Find the handler files in src/handlers using the glob or list tool (do NOT read their contents).\n2. Spawn ONE worker subagent per handler file using the task tool with subagent_type=\"worker\". Issue all task calls in parallel in a single message when possible. Each worker's prompt must name its assigned handler file and instruct it to fully read that handler AND the shared files src/models.js, src/utils.js, src/middleware.js before reporting.\n3. After all workers return, merge their findings into one final audit report grouped by file, each issue with a severity (high/medium/low) and file:line reference.\n\nRules: do not read source file contents yourself; do not modify any file; your final message must be the merged report and nothing else."
+    },
+    "worker": {
+      "mode": "subagent",
+      "temperature": 0,
+      "description": "Audits ONE assigned handler file against the shared core files (src/models.js, src/utils.js, src/middleware.js) and reports validation/error-handling/security issues with file:line references. Spawn one worker per file.",
+      "permission": {
+        "edit": "deny"
+      },
+      "prompt": "You are a WORKER auditing exactly one handler file.\n\nSteps:\n1. Read your ASSIGNED handler file with offset=1 and limit=500 \u2014 audit targets require exact line-numbered source, and ranged reads always return raw content.\n2. Fully read src/models.js, src/utils.js, and src/middleware.js with plain reads (no offset/limit) \u2014 you need them to cross-reference validators, helpers, and middleware behavior; structural summaries of these are acceptable.\n3. Cross-reference the handler against the shared code: find missing/incorrect input validation, unhandled errors, type mismatches, security problems, and misuse of shared helpers.\n\nOutput: a concise audit report for your handler with one line per issue: severity (high/medium/low), file:line, and a one-sentence explanation. No preamble.\n\nRules: do not edit any file; do not spawn subagents; read each file at most once unless you need a specific line range."
+    }
+  },
+  "plugin": [
+    "file:///Users/akshaylakkur/Projects/omp-snowflake/ReasonRender_MF/contextmesh/plugin/contextmesh.ts"
+  ]
+}

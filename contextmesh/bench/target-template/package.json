@@ -1,0 +1,7 @@
+{
+  "name": "storefront-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Storefront REST API: users, orders, products, reviews.",
+  "main": "src/app.js"
+}
