@@ -24,7 +24,9 @@ rrc/
 ├── run.py                      # Lane B: cold/warm arm runner, local metrics, CLI entry point.
 ├── sink.py                     # Lane B: Snowflake per-task inserts and optional curve query.
 └── lane_b/                     # Lane B implementation documentation; no runtime code.
-    ├── Workflow.md             # Single-agent operating workflow and debugging rules.
+    ├── Workflow.md             # Fresh-Luna-per-task workflow; serial by default.
+    ├── SUBAGENT_PROTOCOL.md    # Bounded plan/spec/read-list packet and result format.
+    ├── SHAVE_IF_LOW_TIME.md    # Required two-hour scope-cut list for incomplete work.
     └── PLAN.md                 # Four-hour milestones, scope cuts, and handoff checks.
 
 tests/
@@ -54,8 +56,13 @@ runtime/rrc/<run-id>/           # Ignored JSONL, response evidence, CSV, and run
   and injected `solve` function.
 - `sink.py` receives completed outcomes; it does not call Codex, EverOS, or
   `solve`.
-- `lane_b/` contains decisions and operating notes only. Put executable Lane B
-  code directly in `rrc/` so the ship-fast path stays easy to follow.
+- `lane_b/` contains decisions and operating notes only. `Workflow.md` and
+  `SUBAGENT_PROTOCOL.md` define the fresh-worker orchestration loop. It is
+  serial by default and permits only explicit dependency-free parallel work.
+  `TEST_PLAN.md` defines the separate user-authorized live test procedure.
+  Put executable Lane B code directly in `rrc/` so the ship-fast path stays
+  easy to follow.
 - Tests use fakes or recorded external responses by default. Live Codex,
   EverOS, and Snowflake checks are explicit smoke runs and write only to
-  `runtime/rrc/<run-id>/`.
+  `runtime/rrc/<run-id>/`. They are user-authorized validation work; the
+  coding orchestrator and Luna coding subagents do not launch them.
