@@ -21,8 +21,8 @@ uv run pyright
 uv run pytest
 ```
 
-Pyright runs in `basic` mode, matching the RRCv2 verification contract. The generated-code verifier
-will run Ruff formatting and auto-fixes before Pyright and pytest.
+These checks validate the repository itself. The deliberately small ship-it-fast generated-code
+verifier runs pytest in a temporary subprocess with a timeout; Ruff and Pyright stages are deferred.
 
 ## Layout
 

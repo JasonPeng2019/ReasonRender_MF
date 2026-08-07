@@ -79,12 +79,14 @@ def main():
     report(cold, warm)         # running mean tokens/passed vs task order; matplotlib or CSV+print
     log_to_snowflake(cold+warm)  # Milestone 2
 ```
-Count every token (spec+impl+repair). Hit = `reused and passed`.
+Count every token (spec+impl+repair). A solved task uses `oracle_passed` when an oracle is present,
+otherwise `passed`. A hit uses the same solved predicate plus `reused`.
 
 ## 5) `sink.py` — Snowflake cost-of-record (Milestone 2)
 ```python
 # CREATE TABLE rrc_runs(seq int autoincrement, task_id string, arm string, reused boolean,
-#   spec_tokens int, impl_tokens int, repair_tokens int, total_tokens int, passed boolean, ts timestamp);
+#   spec_tokens int, impl_tokens int, repair_tokens int, total_tokens int, passed boolean,
+#   oracle_passed boolean, ts timestamp);
 def log_to_snowflake(outcomes):
     # INSERT one row per outcome (snowflake-connector-python; executemany)
     ...
@@ -92,7 +94,7 @@ def log_to_snowflake(outcomes):
 # SELECT arm, seq,
 #        AVG(total_tokens) OVER (PARTITION BY arm ORDER BY seq
 #              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_mean_tokens
-# FROM rrc_runs WHERE passed ORDER BY arm, seq;
+# FROM rrc_runs WHERE COALESCE(oracle_passed, passed) ORDER BY arm, seq;
 ```
 De-scope: if SQL curve is tight on time, just `INSERT` (Snowflake requirement met) and plot in Python.
 

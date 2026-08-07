@@ -1,213 +1,78 @@
-"""Frozen interface shared by the RRCv2 implementation lanes.
-
-Changes to this module are coordination sync-points between Lane A and Lane B.
-"""
+"""Frozen seam shared by the ship-it-fast RRCv2 implementation lanes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True)
 class Task:
-    """One coding task in an evaluation run."""
+    """One coding task in the repeating evaluation workload."""
 
     task_id: str
+    family: str
+    params: dict[str, object]
     text: str
-    oracle_tests: str | None = None
-
-
-@dataclass(frozen=True)
-class Slots:
-    """Instance values labelled by the SPEC stage for deterministic reuse."""
-
-    entity: str | None = None
-    identifiers: tuple[str, ...] = ()
-    types: tuple[str, ...] = ()
-    fields: tuple[str, ...] = ()
-    constants: tuple[str, ...] = ()
-    edge_values: tuple[str, ...] = ()
-    values: dict[str, str] = field(default_factory=dict)
+    oracle_tests: str = ""
 
 
 @dataclass(frozen=True)
 class Spec:
-    """Model-authored implementation specification and acceptance tests."""
+    """Reusable implementation contract and its model-authored tests."""
 
-    plan: str
     signature: str
-    contract: str
-    tests: tuple[str, ...]
-    slots: Slots
+    template: str
+    tests: str
 
 
 @dataclass(frozen=True)
-class Template:
-    """Genericized specification stored under an RRCv2-owned fingerprint."""
-
-    external_ref: str
-    spec_skeleton: Spec
-    slot_names: tuple[str, ...]
-
-
-class BranchDecision(str, Enum):
-    """Result of retrieval and deterministic structural matching."""
-
-    REUSE = "reuse"
-    PRIME = "prime"
-    MISS = "miss"
-
-
-class ArmMode(str, Enum):
-    """Evaluation arm selected for a solve."""
-
-    BASELINE = "baseline"
-    CHEAP_ALONE = "cheap_alone"
-    CASCADE = "cascade"
-    COLD = "cold"
-    WARM = "warm"
-
-
-class ModelRole(str, Enum):
-    """Provider-independent model capability requested by Lane A."""
-
-    STRONG = "strong"
-    SMALL = "small"
-
-
-@dataclass(frozen=True)
-class Candidate:
-    """Similarity-index hit resolved through the RRCv2 template store."""
-
-    external_ref: str
-    score: float
-
-
-@dataclass(frozen=True)
-class Usage:
-    """Token usage reported by a model provider."""
-
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-@dataclass(frozen=True)
-class Completion:
-    """One provider completion and its metering information."""
-
-    text: str
-    usage: Usage
-    model: str
-
-
-@dataclass(frozen=True)
-class CostEvent:
-    """Provider-scoped cost event emitted for one model call."""
-
-    arm: str
-    task_id: str
-    stage: str
-    model: str
-    usage: Usage
-    provider: str
-
-
-@dataclass(frozen=True)
-class SolveOutcome:
-    """Complete result returned by the Lane A solve pipeline."""
+class Outcome:
+    """Token and verification result returned by the Lane A solve loop."""
 
     task_id: str
-    arm: str
-    code: str
+    warm: bool
     passed: bool
-    pass_at_1: bool | None
-    branch: BranchDecision
-    repairs: int
-    escalated: bool
-    template: Template | None
-    cost_events: tuple[CostEvent, ...]
+    reused: bool
+    spec_tokens: int
+    impl_tokens: int
+    repair_tokens: int
+    oracle_passed: bool | None = None
+
+    @property
+    def total(self) -> int:
+        """Return all tokens spent by the task's model calls."""
+
+        return self.spec_tokens + self.impl_tokens + self.repair_tokens
 
 
-@dataclass
-class RunContext:
-    """Stable arm/task identity used for provider query attribution."""
-
-    arm: str
-    task_id: str
-
-    def tag(self, stage: str) -> str:
-        """Return the frozen Snowflake query-tag format."""
-
-        return f"rrc:arm={self.arm};task={self.task_id};stage={stage}"
+# A backend performs exactly one completion and reports its total token count.
+Complete = Callable[[str, str], tuple[str, int]]
 
 
-@dataclass
-class Config:
-    """Configuration shared across the two implementation lanes."""
+class Memory(Protocol):
+    """Semantic memory supplied by Lane B."""
 
-    repair_cap_N: int = 2
-    pyright_mode: str = "basic"
-    model_provider: str = "codex"
-    tau_floor: float = 0.35
-    top_k: int = 3
-    prefer_prime_on_shape_diff: bool = True
-    everos_base: str = "http://127.0.0.1:8000/api/v2/memory"
-    app_id: str = "default"
-    project_id: str = "default"
-    agent_identity: str = "rrc"
+    def get(self, task: Task) -> Spec | None:
+        """Return the closest reusable spec, if one is available."""
 
+        ...
 
-class ModelPort(Protocol):
-    """Single-completion provider consumed by the Lane A control loop."""
-
-    provider: str
-
-    def complete(
-        self,
-        role: ModelRole,
-        prompt: str,
-        ctx: RunContext,
-        stage: str,
-    ) -> Completion:
-        """Return exactly one completion for a pipeline stage."""
+    def put(self, task: Task, spec: Spec) -> None:
+        """Store an accepted templated spec for future retrieval."""
 
         ...
 
 
-class RetrievalPort(Protocol):
-    """Similarity-index and exact-template operations consumed by Lane A."""
+class NoMemory:
+    """No-op memory used by the cold arm."""
 
-    def retrieve(self, task: Task, cfg: Config) -> list[Candidate]:
-        """Return candidates whose score meets the configured floor."""
-
-        ...
-
-    def get_template(self, external_ref: str) -> Template | None:
-        """Fetch an exact template from RRCv2's store of record."""
-
-        ...
-
-    def store(self, task: Task, template: Template, outcome: SolveOutcome) -> None:
-        """Persist an accepted template and seed the similarity index."""
-
-        ...
-
-
-class NullRetrieval:
-    """No-op retrieval implementation for cold arms and offline development."""
-
-    def retrieve(self, task: Task, cfg: Config) -> list[Candidate]:
-        """Return no candidates."""
-
-        return []
-
-    def get_template(self, external_ref: str) -> Template | None:
-        """Return no template."""
+    def get(self, task: Task) -> Spec | None:
+        """Always miss."""
 
         return None
 
-    def store(self, task: Task, template: Template, outcome: SolveOutcome) -> None:
-        """Discard a template."""
+    def put(self, task: Task, spec: Spec) -> None:
+        """Discard the spec."""
+
+        return None
