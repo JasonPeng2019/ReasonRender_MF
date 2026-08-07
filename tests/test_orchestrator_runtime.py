@@ -191,6 +191,7 @@ def test_lean_miss_hit_privacy_and_everos_boundary(tmp_path) -> None:
     assert len(search_posts) == 2
     assert len(add_posts) == len(flush_posts) == 1
     assert all(payload["query"] == case_shape for payload in search_posts)
+    assert all(payload["method"] == "keyword" for payload in search_posts)
     add_payload = add_posts[0]
     assert add_payload["external_ref"] == miss.external_ref
     assert add_payload["messages"][0]["content"] == case_shape

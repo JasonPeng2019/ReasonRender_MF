@@ -124,7 +124,7 @@ class EverOSClient:
                 "app_id": self.APP_ID,
                 "project_id": self.PROJECT_ID,
                 "query": case_shape,
-                "method": "hybrid",
+                "method": "keyword",
                 "top_k": self.TOP_K if top_k is None else top_k,
                 "min_score": self.MIN_SCORE if min_score is None else min_score,
             },
