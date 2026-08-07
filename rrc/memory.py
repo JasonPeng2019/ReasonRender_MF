@@ -40,19 +40,23 @@ class EverOSRetrieval(Memory):
     def put(self, task: Task, spec: Spec) -> None:
         """Persist a generic template before indexing its task shape."""
 
-        template = Template(str(uuid.uuid4()), spec, tuple(task.params))
+        if task.case_shape is None:
+            raise ValueError("task case_shape is required for retrieval")
+        template = Template(str(uuid.uuid4()), spec, task.slot_names)
         self._store.put(template)
-        self._client.index(task, template.external_ref)
+        self._client.index(task.case_shape, template.external_ref)
         self._last_stored_ref = template.external_ref
 
     def get(self, task: Task) -> Spec | None:
         """Return the first candidate whose stored slot schema matches exactly."""
 
+        if task.case_shape is None:
+            raise ValueError("task case_shape is required for retrieval")
         self._last_retrieved_ref = None
         self._selected_template = None
-        for external_ref, _score in self._client.search(task.text):
+        for external_ref, _score in self._client.search(task.case_shape):
             template = self._store.get(external_ref)
-            if template is not None and set(template.slot_names) == set(task.params):
+            if template is not None and set(template.slot_names) == set(task.slot_names):
                 self._last_retrieved_ref = external_ref
                 self._selected_template = template
                 return template.spec

@@ -8,8 +8,6 @@ import urllib.request
 import uuid
 from typing import Any
 
-from rrc.contract import Task
-
 
 class EverOSClient:
     """Call only the EverOS namespace owned by the RRC runtime."""
@@ -83,8 +81,8 @@ class EverOSClient:
                 )
             time.sleep(min(max(poll_interval, 0.0), remaining))
 
-    def index(self, task: Task, external_ref: str) -> None:
-        """Index the task shape and flush it under the same correlation ref."""
+    def index(self, case_shape: str, external_ref: str) -> None:
+        """Index only a stable case shape and its SQLite correlation ref."""
 
         session_id = str(uuid.uuid4())
         self._post(
@@ -99,7 +97,7 @@ class EverOSClient:
                         "role": "user",
                         "sender_id": self.USER_ID,
                         "timestamp": int(time.time() * 1000),
-                        "content": task.text,
+                        "content": case_shape,
                     }
                 ],
             },
@@ -114,8 +112,8 @@ class EverOSClient:
             },
         )
 
-    def search(self, query: str) -> list[tuple[str, float]]:
-        """Return only ordered ``(external_ref, score)`` episode candidates."""
+    def search(self, case_shape: str) -> list[tuple[str, float]]:
+        """Search only a stable case shape and return ref/score candidates."""
 
         response = self._post(
             "/api/v2/memory/search",
@@ -123,7 +121,7 @@ class EverOSClient:
                 "user_id": self.USER_ID,
                 "app_id": self.APP_ID,
                 "project_id": self.PROJECT_ID,
-                "query": query,
+                "query": case_shape,
                 "method": "hybrid",
                 "top_k": self.TOP_K,
                 "min_score": self.MIN_SCORE,
