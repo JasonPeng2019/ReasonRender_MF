@@ -1,1 +1,16 @@
 *.codex
+
+# BEGIN agent-workspace managed
+.agent-workspace/
+.claude/
+.codex/
+.generated/
+.vscode/
+CLAUDE.local.md
+PLAN.md
+HANDOFF.md
+# END agent-workspace managed
+
+# Additional agent-workspace generated files
+.workspace/
+CLAUDE.local.md.pre-attach.bak
