@@ -67,6 +67,6 @@
     }
   },
   "plugin": [
-    "file:///Users/akshaylakkur/Projects/omp-snowflake/ReasonRender_MF/contextmesh/plugin/contextmesh.ts"
+    "{env:CONTEXTMESH_PLUGIN_PATH}"
   ]
 }
