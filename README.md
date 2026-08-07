@@ -24,6 +24,11 @@ uv run pytest
 These checks validate the repository itself. The deliberately small ship-it-fast generated-code
 verifier runs pytest in a temporary subprocess with a timeout; Ruff and Pyright stages are deferred.
 
+Lane A's frozen public call is `solve(task, *, mode, model, retrieval, cfg)`. It supports COLD and
+WARM, emits one `CostEvent` per model call, stores only canonical generic templates after WARM
+success, and exposes persistence failures as `StoreFailure` with the completed outcome attached.
+See [ADR 0001](docs/decisions/0001-rrcv2-full-two-store-contract.md).
+
 ## Layout
 
 ```text

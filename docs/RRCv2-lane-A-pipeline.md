@@ -8,16 +8,19 @@ design: a SPEC produces labelled dynamic slots; RRC stores only a generic
 renders the template with its own slot values. It deliberately cuts the
 unrelated competition arms and refinement features in `RRCv2.md`.
 
-`rrc/contract.py` is frozen. Use its `Task`, `Spec`, `Slots`, `Template`,
-`RetrievalPort`, `ModelPort`, and `SolveOutcome` exactly as written.
+`rrc/contract.py` is frozen from `c429fbe` plus the public `Solver` and typed
+`StoreFailure` decisions in ADR 0001. Use its `Task`, `Spec`, `Slots`,
+`Template`, `RetrievalPort`, `ModelPort`, and `SolveOutcome` exactly as written.
+The public entry point is `solve(task, *, mode, model, retrieval, cfg)`; it
+constructs `RunContext` internally.
 
 ## In scope
 
 - COLD and WARM `solve()` paths only.
 - Fresh SPEC JSON with `plan`, `signature`, `contract`, `tests`, and `slots`.
-- Deterministic `templatize()`, `extract_slot_values()`, `render()`, exact
+- Deterministic `templatize()`, `parse_task_metadata()`, `render()`, exact
   structural matching, and a loose rendered-spec sanity check.
-- One cheap implementation attempt, one cheap repair, then one fresh-SPEC
+- One cheap implementation attempt, at most one cheap repair, then one fresh-SPEC
   fallback when a reused template fails.
 - `pytest` in a timed subprocess and complete `CostEvent` capture.
 
@@ -31,21 +34,35 @@ unrelated competition arms and refinement features in `RRCv2.md`.
 ## Dynamic-template convention
 
 The fast workload must make slot extraction deterministic. Each generated
-`Task.text` ends with an `RRC_SLOT_VALUES` JSON object, for example:
+`Task.text` ends with these two lines, in this order:
 
 ```text
 Build a repository lookup for an Order.
+RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":["id"]}
 RRC_SLOT_VALUES: {"entity":"Order","function":"get_order","field":"id"}
 ```
 
-`extract_slot_values()` reads that object. It never asks a model to infer slot
-values. A missing required value makes the candidate a MISS instead of guessing.
+The parser rejects missing or duplicate markers, duplicate JSON keys, unknown
+shape keys, invalid names or types, arity/type disagreement, duplicate fields,
+and colliding concrete values. It never asks a model to infer slot values. A
+missing required value makes the candidate a MISS instead of guessing.
 
-`templatize()` replaces every value listed in `Spec.slots.values` in the plan,
-signature, contract, and tests with named placeholders. It returns a `Template`
-whose `external_ref` is a stable fingerprint over the generic skeleton and
-`slot_names`. The stored artifact is this full templated spec skeleton, not just
-the plan field and never a rendered instance.
+Name grammar is fail-closed: slot keys, `RRC_SHAPE.fields`, conventional
+`function`/`field`/`identifier` slot values, and SPEC `identifiers`/`fields`
+must be non-keyword ASCII Python identifiers matching
+`[A-Za-z_][A-Za-z0-9_]*`. Entity, constant, and edge values remain arbitrary
+non-empty strings. Type grammar permits ASCII names, dotted names, nested
+subscriptions/generics, `|` unions, `None`, and ellipsis/list arguments inside
+subscriptions; calls, lambdas, arithmetic, and other executable expressions
+are rejected.
+
+SPEC JSON has exactly `plan`, `signature`, `contract`, `tests`, and `slots`;
+`slots` has exactly `entity`, `identifiers`, `types`, `fields`, `constants`,
+`edge_values`, and `values`. `templatize()` replaces every concrete slot value
+across all textual and nested slot fields. It rejects collisions, leakage, and
+non-round-trips and returns a defensive `Template` whose `external_ref` is the
+canonical SHA-256 of the full generic skeleton plus sorted `slot_names`. The
+stored artifact is never a rendered instance.
 
 ## Minimal solve flow
 
@@ -53,7 +70,7 @@ the plan field and never a rendered instance.
 WARM task
   -> retrieval.retrieve(task)
   -> retrieval.get_template(external_ref) for each candidate
-  -> exact structural match + deterministic render + loose sanity check
+  -> exact structural match + deterministic render + loose direct-call sanity check
   -> REUSE, or MISS
 
 MISS / COLD
@@ -62,15 +79,23 @@ MISS / COLD
 REUSE or fresh SPEC
   -> small IMPLEMENT
   -> pytest
-  -> one small repair + pytest
+  -> zero or one small repair + pytest
   -> reused failure only: one fresh SPEC fallback, then implement + pytest
   -> pass: templatize and return Template in SolveOutcome
 ```
 
-On WARM success, `solve()` calls `retrieval.store(task, template, outcome)`.
-The store call happens only after tests pass. A missing own-store template, an
-empty slot, malformed rendering, or any non-EXACT candidate is a MISS; it is
-not an exception and it never reads spec text from EverOS.
+On WARM success, `solve()` calls `retrieval.store(task, template, outcome)`
+exactly once. The store call happens only after tests pass. A store exception is
+raised as `StoreFailure` carrying the completed outcome and chained cause. A
+missing own-store template, fingerprint mismatch, empty slot, malformed render,
+or any non-EXACT candidate is a MISS; it is not an exception and it never reads
+spec text from EverOS.
+
+`Config.repair_cap_N` defaults to one: zero disables repair, positive values are
+capped at one, and negative values fail before any port call. Reuse failure gets
+one fresh-SPEC fallback and one fallback implementation, with no fallback
+repair. Cost stages are frozen as `spec`, `implement`, `repair`,
+`fallback_spec`, and `fallback_implement`.
 
 ## Module ownership
 

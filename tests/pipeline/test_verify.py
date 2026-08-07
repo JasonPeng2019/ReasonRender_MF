@@ -10,6 +10,16 @@ def test_run_pytest_executes_code_and_tests_together() -> None:
     assert passed is True, output
 
 
+def test_run_pytest_accepts_multiple_test_artifacts() -> None:
+    code = "def identity(value: int) -> int:\n    return value"
+    tests = (
+        "def test_one(): assert identity(1) == 1",
+        "def test_two(): assert identity(2) == 2",
+    )
+    passed, output = run_pytest(code, tests)
+    assert passed is True, output
+
+
 def test_run_pytest_returns_failure_output() -> None:
     code = "def double(value: int) -> int:\n    return value"
     tests = "def test_double():\n    assert double(3) == 6"

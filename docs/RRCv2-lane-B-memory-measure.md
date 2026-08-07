@@ -56,11 +56,17 @@ rrc/model.py       # CodexModel: ModelPort.complete(), one JSONL completion
 rrc/store.py       # SQLite put/get of exact Template JSON by external_ref
 rrc/everos.py      # add, flush, search, health wait; response envelope parsing
 rrc/memory.py      # EverOSRetrieval: RetrievalPort join of EverOS + SQLite
-rrc/workload.py    # 12-20 interleaved tasks with RRC_SLOT_VALUES JSON
+rrc/workload.py    # 12-20 tasks ending in strict RRC_SHAPE + RRC_SLOT_VALUES JSON
 rrc/run.py         # COLD/WARM loop, fake solve during isolated development
 rrc/sink.py        # one Snowflake row per SolveOutcome / CostEvent
 tests/lane_b/...   # fake HTTP/SQLite tests plus explicit live smoke tests
 ```
+
+The workload must emit the strict marker grammar frozen by ADR 0001 and the
+Lane A build sheet: identifier-bearing values and structural fields are valid
+ASCII Python identifiers, while argument types use the supported non-executable
+annotation grammar. Lane B generates these values; Lane A remains the enforcing
+boundary.
 
 ## The EverOS patch
 
@@ -90,7 +96,9 @@ ref is ignored as a MISS. Lane B never invents an alternate ID.
 
 If the EverOS write fails after SQLite succeeds, leave the template in SQLite;
 later lookup simply misses until EverOS has an index entry. Do not delete the
-template and do not report a false success for the index write.
+template and do not report a false success for the index write. Lane A exposes
+that failure as `StoreFailure` with the already completed `SolveOutcome`, so
+Lane B can persist all cost events without reporting normal solve success.
 
 `retrieve(task, cfg)` searches the episode track with fixed owner/scope,
 `method="hybrid"`, `top_k=cfg.top_k`, and `min_score=cfg.tau_floor`. It returns

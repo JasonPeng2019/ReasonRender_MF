@@ -8,10 +8,15 @@ import tempfile
 from pathlib import Path
 
 
-def run_pytest(code: str, tests: str, timeout: float = 15) -> tuple[bool, str]:
+def run_pytest(
+    code: str,
+    tests: str | tuple[str, ...],
+    timeout: float = 15,
+) -> tuple[bool, str]:
     """Run generated code and tests in a temporary subprocess with a wall-clock limit."""
 
-    source = f"{code.rstrip()}\n\n{tests.rstrip()}\n"
+    test_source = tests if isinstance(tests, str) else "\n\n".join(tests)
+    source = f"{code.rstrip()}\n\n{test_source.rstrip()}\n"
     with tempfile.TemporaryDirectory(prefix="rrcv2-") as directory:
         test_file = Path(directory) / "test_generated.py"
         test_file.write_text(source, encoding="utf-8")

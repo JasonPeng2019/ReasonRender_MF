@@ -1,166 +1,261 @@
-"""Template helpers and the ship-it-fast Lane A solve loop."""
+"""Public COLD/WARM control loop for RRCv2 Lane A."""
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Mapping
-
-from rrc.contract import Complete, Memory, Outcome, Spec, Task
-from rrc.pipeline.stages import implement, repair, spec
+from rrc.contract import (
+    ArmMode,
+    BranchDecision,
+    Candidate,
+    Config,
+    CostEvent,
+    ModelPort,
+    RetrievalPort,
+    RunContext,
+    SolveOutcome,
+    Spec,
+    StoreFailure,
+    Task,
+    Template,
+)
+from rrc.pipeline.stages import implement_stage, repair_stage, spec_stage
+from rrc.pipeline.template import resolve_template, templatize
 from rrc.pipeline.verify import run_pytest
 
 
-def _normalize_param(value: object) -> object:
-    """Normalize JSON-like structured values before deterministic serialization."""
-
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _normalize_param(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_param(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        normalized = [_normalize_param(item) for item in value]
-        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
-    raise TypeError(f"task parameters must be JSON-like, got {type(value).__name__}")
+def _oracle_result(task: Task, code: str) -> bool | None:
+    if task.oracle_tests is None or not task.oracle_tests.strip():
+        return None
+    passed, _ = run_pytest(code, task.oracle_tests)
+    return passed
 
 
-def _serialize_param(value: object) -> str:
-    """Return the stable textual representation used to fill one placeholder."""
-
-    normalized = _normalize_param(value)
-    if isinstance(normalized, str):
-        return normalized
-    return json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def _map_spec(specification: Spec, transform: Callable[[str], str]) -> Spec:
-    return Spec(
-        signature=transform(specification.signature),
-        template=transform(specification.template),
-        tests=transform(specification.tests),
-    )
-
-
-def to_template(specification: Spec, params: dict[str, object]) -> Spec:
-    """Replace concrete parameter values with their named placeholders."""
-
-    replacements = [(_serialize_param(value), f"{{{key}}}") for key, value in params.items()]
-    replacements.sort(key=lambda item: len(item[0]), reverse=True)
-
-    def replace(text: str) -> str:
-        for concrete, placeholder in replacements:
-            if concrete:
-                text = text.replace(concrete, placeholder)
-        return text
-
-    return _map_spec(specification, replace)
-
-
-def render(specification: Spec, params: dict[str, object]) -> Spec:
-    """Fill known named placeholders without interpreting unrelated Python braces."""
-
-    replacements = [(f"{{{key}}}", _serialize_param(value)) for key, value in params.items()]
-
-    def replace(text: str) -> str:
-        for placeholder, concrete in replacements:
-            text = text.replace(placeholder, concrete)
-        return text
-
-    return _map_spec(specification, replace)
-
-
-def _failed_outcome(
+def _outcome(
     task: Task,
+    mode: ArmMode,
     *,
-    warm: bool,
-    reused: bool,
-    spec_tokens: int,
-) -> Outcome:
-    return Outcome(
+    code: str,
+    passed: bool,
+    branch: BranchDecision,
+    repairs: int,
+    escalated: bool,
+    template: Template | None,
+    events: list[CostEvent],
+) -> SolveOutcome:
+    return SolveOutcome(
         task_id=task.task_id,
-        warm=warm,
-        passed=False,
-        reused=reused,
-        spec_tokens=spec_tokens,
-        impl_tokens=0,
-        repair_tokens=0,
-        oracle_passed=None,
+        arm=mode.value,
+        code=code,
+        passed=passed,
+        pass_at_1=_oracle_result(task, code),
+        branch=branch,
+        repairs=repairs,
+        escalated=escalated,
+        template=template,
+        cost_events=tuple(events),
     )
+
+
+def _implement_with_optional_repair(
+    specification: Spec,
+    model: ModelPort,
+    ctx: RunContext,
+    events: list[CostEvent],
+    *,
+    allow_repair: bool,
+) -> tuple[str, bool, int]:
+    code, event = implement_stage(specification, model, ctx)
+    events.append(event)
+    passed, output = run_pytest(code, specification.tests)
+    repairs = 0
+    if not passed and allow_repair:
+        code, event = repair_stage(specification, code, output, model, ctx)
+        events.append(event)
+        repairs = 1
+        passed, _ = run_pytest(code, specification.tests)
+    return code, passed, repairs
+
+
+def _resolve_reuse(
+    task: Task,
+    retrieval: RetrievalPort,
+    cfg: Config,
+) -> tuple[Spec, Template] | None:
+    for candidate in retrieval.retrieve(task, cfg):
+        if not isinstance(candidate, Candidate) or not candidate.external_ref:
+            continue
+        template = retrieval.get_template(candidate.external_ref)
+        if not isinstance(template, Template) or template.external_ref != candidate.external_ref:
+            continue
+        rendered = resolve_template(template, task)
+        if rendered is not None:
+            return rendered, template
+    return None
+
+
+def _store_success(
+    task: Task,
+    outcome: SolveOutcome,
+    retrieval: RetrievalPort,
+) -> SolveOutcome:
+    template = outcome.template
+    if not outcome.passed or template is None:
+        return outcome
+    try:
+        retrieval.store(task, template, outcome)
+    except Exception as error:
+        raise StoreFailure(outcome) from error
+    return outcome
+
+
+def _fresh(
+    task: Task,
+    mode: ArmMode,
+    model: ModelPort,
+    retrieval: RetrievalPort,
+    ctx: RunContext,
+    *,
+    allow_repair: bool,
+) -> SolveOutcome:
+    events: list[CostEvent] = []
+    specification, event = spec_stage(task, model, ctx)
+    events.append(event)
+    if specification is None:
+        return _outcome(
+            task,
+            mode,
+            code="",
+            passed=False,
+            branch=BranchDecision.MISS,
+            repairs=0,
+            escalated=False,
+            template=None,
+            events=events,
+        )
+
+    code, passed, repairs = _implement_with_optional_repair(
+        specification,
+        model,
+        ctx,
+        events,
+        allow_repair=allow_repair,
+    )
+    template = templatize(specification) if passed else None
+    outcome = _outcome(
+        task,
+        mode,
+        code=code,
+        passed=passed,
+        branch=BranchDecision.MISS,
+        repairs=repairs,
+        escalated=False,
+        template=template,
+        events=events,
+    )
+    return _store_success(task, outcome, retrieval) if mode is ArmMode.WARM else outcome
+
+
+def _reuse(
+    task: Task,
+    mode: ArmMode,
+    model: ModelPort,
+    retrieval: RetrievalPort,
+    ctx: RunContext,
+    specification: Spec,
+    template: Template,
+    *,
+    allow_repair: bool,
+) -> SolveOutcome:
+    events: list[CostEvent] = []
+    code, passed, repairs = _implement_with_optional_repair(
+        specification,
+        model,
+        ctx,
+        events,
+        allow_repair=allow_repair,
+    )
+    if passed:
+        return _store_success(
+            task,
+            _outcome(
+                task,
+                mode,
+                code=code,
+                passed=True,
+                branch=BranchDecision.REUSE,
+                repairs=repairs,
+                escalated=False,
+                template=template,
+                events=events,
+            ),
+            retrieval,
+        )
+
+    fallback_spec, event = spec_stage(task, model, ctx, stage="fallback_spec")
+    events.append(event)
+    if fallback_spec is None:
+        return _outcome(
+            task,
+            mode,
+            code=code,
+            passed=False,
+            branch=BranchDecision.REUSE,
+            repairs=repairs,
+            escalated=True,
+            template=None,
+            events=events,
+        )
+
+    code, event = implement_stage(fallback_spec, model, ctx, stage="fallback_implement")
+    events.append(event)
+    passed, _ = run_pytest(code, fallback_spec.tests)
+    fallback_template = templatize(fallback_spec) if passed else None
+    outcome = _outcome(
+        task,
+        mode,
+        code=code,
+        passed=passed,
+        branch=BranchDecision.REUSE,
+        repairs=repairs,
+        escalated=True,
+        template=fallback_template,
+        events=events,
+    )
+    return _store_success(task, outcome, retrieval)
 
 
 def solve(
     task: Task,
     *,
-    warm: bool,
-    complete: Complete,
-    memory: Memory,
-    strong: str,
-    cheap: str,
-) -> Outcome:
-    """Turn one task into verified code with at most one cheap repair call."""
+    mode: ArmMode,
+    model: ModelPort,
+    retrieval: RetrievalPort,
+    cfg: Config,
+) -> SolveOutcome:
+    """Solve a task through the frozen Lane A public seam."""
 
-    spec_tokens = 0
-    hit = memory.get(task) if warm else None
-    reused = hit is not None
+    if mode not in (ArmMode.COLD, ArmMode.WARM):
+        raise ValueError(f"unsupported Lane A arm: {mode!r}")
+    if isinstance(cfg.repair_cap_N, bool) or not isinstance(cfg.repair_cap_N, int):
+        raise ValueError("repair_cap_N must be an integer")
+    if cfg.repair_cap_N < 0:
+        raise ValueError("repair_cap_N must be non-negative")
 
-    if hit is None:
-        templated_spec, spec_tokens = spec(task, complete, strong)
-        if templated_spec is None:
-            return _failed_outcome(
-                task,
-                warm=warm,
-                reused=False,
-                spec_tokens=spec_tokens,
-            )
-    else:
-        templated_spec = hit
+    ctx = RunContext(arm=mode.value, task_id=task.task_id)
+    allow_repair = cfg.repair_cap_N > 0
+    if mode is ArmMode.COLD:
+        return _fresh(task, mode, model, retrieval, ctx, allow_repair=allow_repair)
 
-    try:
-        concrete_spec = render(templated_spec, task.params)
-    except (TypeError, ValueError):
-        return _failed_outcome(
-            task,
-            warm=warm,
-            reused=reused,
-            spec_tokens=spec_tokens,
-        )
-
-    code, impl_tokens = implement(concrete_spec, complete, cheap)
-    passed, pytest_output = run_pytest(code, concrete_spec.tests)
-    repair_tokens = 0
-    if not passed:
-        code, repair_tokens = repair(
-            concrete_spec,
-            code,
-            pytest_output,
-            complete,
-            cheap,
-        )
-        passed, _ = run_pytest(code, concrete_spec.tests)
-
-    oracle_passed = None
-    if task.oracle_tests.strip():
-        oracle_passed, _ = run_pytest(code, task.oracle_tests)
-
-    outcome = Outcome(
-        task_id=task.task_id,
-        warm=warm,
-        passed=passed,
-        reused=reused,
-        spec_tokens=spec_tokens,
-        impl_tokens=impl_tokens,
-        repair_tokens=repair_tokens,
-        oracle_passed=oracle_passed,
+    reusable = _resolve_reuse(task, retrieval, cfg)
+    if reusable is None:
+        return _fresh(task, mode, model, retrieval, ctx, allow_repair=allow_repair)
+    specification, template = reusable
+    return _reuse(
+        task,
+        mode,
+        model,
+        retrieval,
+        ctx,
+        specification,
+        template,
+        allow_repair=allow_repair,
     )
-
-    if warm and not reused and passed:
-        memory.put(task, to_template(concrete_spec, task.params))
-
-    return outcome

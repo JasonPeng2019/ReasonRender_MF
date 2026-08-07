@@ -1,29 +1,46 @@
-from rrc.contract import NoMemory, Outcome, Spec, Task
+from rrc.contract import (
+    ArmMode,
+    BranchDecision,
+    Config,
+    NullRetrieval,
+    SolveOutcome,
+    Solver,
+    StoreFailure,
+)
+from rrc.pipeline import solve
+
+from tests.pipeline.helpers import make_task
 
 
-def test_outcome_total_counts_every_model_stage() -> None:
-    outcome = Outcome(
-        task_id="0001",
-        warm=True,
+def test_public_solver_has_the_frozen_callable_seam() -> None:
+    solver: Solver = solve
+    assert callable(solver)
+    assert Config().repair_cap_N == 1
+
+
+def test_store_failure_retains_completed_outcome() -> None:
+    outcome = SolveOutcome(
+        task_id="t",
+        arm="warm",
+        code="pass",
         passed=True,
-        reused=False,
-        spec_tokens=100,
-        impl_tokens=40,
-        repair_tokens=10,
-        oracle_passed=True,
+        pass_at_1=True,
+        branch=BranchDecision.MISS,
+        repairs=0,
+        escalated=False,
+        template=None,
+        cost_events=(),
     )
+    failure = StoreFailure(outcome)
+    assert failure.outcome is outcome
 
-    assert outcome.total == 150
+
+def test_null_retrieval_is_a_typed_no_op() -> None:
+    retrieval = NullRetrieval()
+    assert retrieval.retrieve(make_task(), Config()) == []
+    assert retrieval.get_template("missing") is None
 
 
-def test_no_memory_is_a_no_op() -> None:
-    memory = NoMemory()
-    task = Task(
-        task_id="0001",
-        family="identity",
-        params={"function": "identity"},
-        text="Implement an identity function.",
-    )
-
-    assert memory.get(task) is None
-    assert memory.put(task, Spec("def identity(): ...", "Identity.", "tests")) is None
+def test_only_cold_and_warm_are_lane_a_modes() -> None:
+    assert ArmMode.COLD.value == "cold"
+    assert ArmMode.WARM.value == "warm"

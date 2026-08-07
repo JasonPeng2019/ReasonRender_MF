@@ -1,5 +1,12 @@
 # RRCv2 — Ship-It-Fast Plan (4h, two lanes) — Codex CLI + EverOS + Snowflake
 
+> **SUPERSEDED CONTRACT PROFILE.** The family/params `Complete`/`Memory`/`Outcome` shortcut below
+> is retained only as historical context. Do not implement it. The authoritative shared seam is
+> `rrc/contract.py` from the full two-store design recorded in
+> [`decisions/0001-rrcv2-full-two-store-contract.md`](decisions/0001-rrcv2-full-two-store-contract.md),
+> with the active lane profiles in `RRCv2-lane-A-pipeline.md` and
+> `RRCv2-lane-B-memory-measure.md`.
+
 **Goal (the only one):** lower **tokens per solved task**, measured. Win = a curve: warm (reuse stored specs via EverOS) tokens/solved falls below cold (no memory) as the workload repeats.
 
 **Three hard requirements (none optional):** model backend = **Codex CLI (subscription, headless `codex exec`)**; memory = **EverOS**; cost-of-record = **Snowflake**.
@@ -12,7 +19,7 @@
 
 ---
 
-## The tiny shared contract (freeze it; edits are a sync point)
+## Historical tiny shared contract (SUPERSEDED; do not implement)
 
 ```python
 # rrc/contract.py  — FROZEN
