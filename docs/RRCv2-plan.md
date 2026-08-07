@@ -23,12 +23,12 @@ from typing import Optional, Protocol, Callable
 class Task:
     task_id: str
     family: str          # retrieval key; also the EverOS session_id (the join trick)
-    params: dict         # slot values, e.g. {"entity":"Order","fields":["id","total"]}
+    params: dict[str, object] # JSON-like slot values; non-strings render as canonical JSON
     text: str            # NL description; fed to Codex AND embedded by EverOS for matching
-    oracle_tests: str    # EVAL ONLY — never shown to a model
+    oracle_tests: str = "" # EVAL ONLY — run separately and never shown to a model
 
 @dataclass
-class Spec:              # stored as templates so reuse is str.format(), not NLP
+class Spec:              # stored as named templates so reuse is replacement, not NLP
     signature: str
     template: str        # spec body with {param} placeholders
     tests: str           # pytest snippet with {param} placeholders
@@ -37,6 +37,7 @@ class Spec:              # stored as templates so reuse is str.format(), not NLP
 class Outcome:
     task_id: str; warm: bool; passed: bool; reused: bool
     spec_tokens: int; impl_tokens: int; repair_tokens: int
+    oracle_passed: Optional[bool] = None
     @property
     def total(self): return self.spec_tokens + self.impl_tokens + self.repair_tokens
 
@@ -56,7 +57,16 @@ def solve(task: Task, *, warm: bool, complete: Complete, memory: Memory,
           strong: str, cheap: str) -> Outcome: ...
 ```
 
-Note vs. the previous draft: `Memory.get/put` now take the whole `Task` (EverOS matches on `task.text`, not an exact family key). Everything else is unchanged.
+Note vs. the previous draft: `Memory.get/put` take the whole `Task` (EverOS matches on
+`task.text`, not an exact family key). The clarifications below define oracle reporting, malformed
+SPEC behavior, deterministic structured params, and ACCEPT-only storage.
+
+`passed` means the final implementation passes the model-authored spec tests. If
+`oracle_tests` is non-empty, Lane A runs it separately against the final code and records
+`oracle_passed`; the oracle is never included in SPEC, IMPLEMENT, or repair prompts. A malformed
+SPEC response returns a failed `Outcome` with its spec tokens recorded and skips implementation.
+`params` values must be JSON-like (scalars, mappings, and sequences); Lane A renders non-string
+values as sorted, compact JSON so reuse is deterministic.
 
 ---
 
@@ -111,7 +121,14 @@ EverOS is a requirement, so it is **not** on the ladder; if EverOS is down durin
 
 ## Measure (the deliverable)
 
-Per task log: `reused`, `spec_tokens`, `impl_tokens`, `repair_tokens`, `total`, `passed`, `arm`. Report **mean tokens per *passed* task, warm vs cold**, and the running curve over task order. On reuse, `spec_tokens = 0` — that's the win. A flat warm curve = the workload didn't repeat (fix the generator) or EverOS isn't matching (lower `min_score` / check index lag).
+Per task log: `reused`, `spec_tokens`, `impl_tokens`, `repair_tokens`, `total`, `passed`,
+`oracle_passed`, `arm`. For benchmark tasks, report **mean tokens per oracle-passing task,
+warm vs cold** and the running curve over task order; fall back to `passed` only when no oracle is
+provided. On reuse, `spec_tokens = 0` — that's the win. A flat warm curve = the workload didn't
+repeat (fix the generator) or EverOS isn't matching (lower `min_score` / check index lag).
+
+Lane A writes a newly generated template to memory only after the implementation passes the spec
+tests (including after a successful repair). Failed or malformed attempts never seed memory.
 
 ## EverOS join trick (why there's no fork patch)
 
