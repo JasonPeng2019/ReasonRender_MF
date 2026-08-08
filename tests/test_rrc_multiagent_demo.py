@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -295,6 +296,56 @@ def test_planner_failure_persists_raw_process_evidence(tmp_path: Path) -> None:
     assert event["stdout"] == "RAW STDOUT"
     assert event["stderr"] == "RAW STDERR"
     assert event["parse_status"] == "process_error"
+
+
+def test_planner_passes_a_bounded_deadline_and_isolated_environment(tmp_path: Path) -> None:
+    from rrc.multiagent_demo import CodexPacketPlanner, audit_task
+
+    task, _ = audit_task("bounded", "Audit src/handlers/auth.js against the shared files.")
+    artifact = tmp_path / "planner.jsonl"
+    observed: dict[str, object] = {}
+
+    def timed_out_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, int | float)
+        raise subprocess.TimeoutExpired(cmd=["codex"], timeout=float(timeout))
+
+    planner = CodexPacketPlanner(
+        model="fake",
+        task=task,
+        artifact_log=artifact,
+        timeout=0.05,
+        env={"CODEX_HOME": "/isolated/planner", "OLLAMA_API_KEY": "not-logged"},
+        run=timed_out_run,
+    )
+
+    with pytest.raises(TimeoutError, match="planner timed out"):
+        planner("generic prompt", "fake")
+
+    assert observed["timeout"] == 0.05
+    assert observed["env"] == {
+        "CODEX_HOME": "/isolated/planner",
+        "OLLAMA_API_KEY": "not-logged",
+    }
+    event = json.loads(artifact.read_text())
+    assert event["parse_status"] == "timeout"
+    assert event["timeout_seconds"] == 0.05
+    assert "not-logged" not in artifact.read_text()
+
+
+def test_nonblocking_lock_deadline_does_not_wait_for_the_holder(tmp_path: Path) -> None:
+    import fcntl
+
+    from rrc.multiagent_demo import acquire_exclusive_lock
+
+    lock = tmp_path / "packets.lock"
+    with lock.open("a+") as holder, lock.open("a+") as follower:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="RRC packet lock"):
+            acquire_exclusive_lock(follower, timeout=0.03, poll_interval=0.005)
+        assert time.monotonic() - started < 0.25
 
 
 def test_planner_normalizes_controller_owned_audit_fields(tmp_path: Path) -> None:

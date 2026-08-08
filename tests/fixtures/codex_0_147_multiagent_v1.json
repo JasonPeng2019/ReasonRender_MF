@@ -1,0 +1,28 @@
+{
+  "codex_version": "codex-cli 0.147.0",
+  "feature": "multi_agent_v2=false",
+  "discovery": {
+    "type": "tool_search_call",
+    "execution": "client",
+    "output_type": "tool_search_output",
+    "role_declaration_required_for_agent_type": true
+  },
+  "spawn": {
+    "namespace": "multi_agent_v1",
+    "name": "spawn_agent",
+    "arguments": ["message", "items", "agent_type", "model", "reasoning_effort", "service_tier", "fork_context"],
+    "hook_tool_name": "spawn_agent",
+    "result": ["agent_id", "nickname"]
+  },
+  "wait": {
+    "namespace": "multi_agent_v1",
+    "name": "wait_agent",
+    "arguments": ["targets", "timeout_ms"],
+    "hook_tool_name": "multi_agent_v1wait_agent",
+    "result": ["status", "timed_out"]
+  },
+  "lifecycle": {
+    "start": ["agent_id", "agent_type"],
+    "stop": ["agent_id", "agent_type", "last_assistant_message", "stop_hook_active"]
+  }
+}

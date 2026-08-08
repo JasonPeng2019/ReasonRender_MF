@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Combined ContextMesh + ReasonRenderCoding multi-agent demo.
 #
-#   ./RRDdemo.sh up       start Tollgate + EverOS
+#   ./RRDdemo.sh up       start dedicated RRD Tollgate + EverOS
 #   ./RRDdemo.sh prep     new round + seed shared digests + preflight
-#   ./RRDdemo.sh a        open the COLD opencode TUI (+ ContextMesh, terminal 1)
-#   ./RRDdemo.sh b        open the WARM opencode TUI (+ ContextMesh, terminal 2)
+#   ./RRDdemo.sh a        open the COLD Codex TUI (+ ContextMesh, terminal 1)
+#   ./RRDdemo.sh b        open the WARM Codex TUI (+ ContextMesh, terminal 2)
 #   ./RRDdemo.sh meter    open combined live token/reuse meter   (terminal 3)
 #   ./RRDdemo.sh down     stop the stack
+#   ./RRDdemo.sh canary   optional live Ollama Responses connectivity check
 #
 # Paste the same four-handler audit prompt into both TUIs. Each orchestrator
-# launches four real OpenCode worker subagents. ContextMesh optimizes their
+# launches four real Codex worker subagents. ContextMesh optimizes their
 # overlapping reads/results; RRC plans every COLD worker but plans once and
 # reuses the validated packet for WARM siblings.
 set -euo pipefail
@@ -28,12 +29,11 @@ load_round() {
 }
 
 case "$cmd" in
-  up)    exec "$ROOT/scripts/start_stack.sh" ;;
-  down)  exec "$ROOT/scripts/stop_stack.sh" ;;
+  up)    exec "$ROOT/scripts/rrd_start_stack.sh" ;;
+  down)  exec "$ROOT/scripts/rrd_stop_stack.sh" ;;
   prep)
-    "$ROOT/scripts/start_stack.sh"
-    # Fail with the actionable auth/connectivity report before starting an
-    # OpenCode seed session (which would otherwise enter its opaque retry loop).
+    "$ROOT/scripts/rrd_start_stack.sh"
+    # Validate local services/config before the model-backed seed step.
     "$ROOT/scripts/rrd_demo_preflight.sh"
     "$ROOT/scripts/rrd_demo_tui.sh" reset
     "$ROOT/scripts/rrd_demo_tui.sh" seed
@@ -43,8 +43,12 @@ case "$cmd" in
     command -v pbcopy >/dev/null && pbcopy < "$ROOT/RRD-demo-prompt.txt" && echo "audit prompt copied to clipboard"
     ;;
   a|b)
-    "$ROOT/scripts/start_stack.sh"
+    "$ROOT/scripts/rrd_start_stack.sh"
     exec "$ROOT/scripts/rrd_demo_tui.sh" "$cmd"
+    ;;
+  canary)
+    "$ROOT/scripts/rrd_start_stack.sh"
+    exec "$ROOT/scripts/rrd_demo_preflight.sh" --canary
     ;;
   seed)    exec "$ROOT/scripts/rrd_demo_tui.sh" seed ;;
   reset)   exec "$ROOT/scripts/rrd_demo_tui.sh" reset ;;

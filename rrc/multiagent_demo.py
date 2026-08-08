@@ -7,13 +7,14 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import IO, Protocol, cast
 
 from rrc.everos import EverOSClient
 from rrc.model import parse_codex_jsonl
@@ -89,8 +90,50 @@ class SearchIndex(Protocol):
 
 class RunProcess(Protocol):
     def __call__(
-        self, args: Sequence[str], *, capture_output: bool, text: bool, check: bool
+        self,
+        args: Sequence[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+        timeout: float,
+        env: Mapping[str, str] | None,
     ) -> subprocess.CompletedProcess[str]: ...
+
+
+def _run_process_group(
+    args: Sequence[str],
+    *,
+    capture_output: bool,
+    text: bool,
+    check: bool,
+    timeout: float,
+    env: Mapping[str, str] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a planner in its own process group and reap the whole group on timeout."""
+
+    if not capture_output or not text or check:
+        raise ValueError("bounded planner runner requires captured text with check=False")
+    process = subprocess.Popen(  # noqa: S603 - argv is controller-owned
+        list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=None if env is None else dict(env),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            cmd=list(args), timeout=timeout, output=stdout, stderr=stderr
+        ) from exc
+    return subprocess.CompletedProcess(list(args), process.returncode, stdout, stderr)
 
 
 class AuditPacketPolicy(OrchestratorPolicy):
@@ -383,12 +426,18 @@ class CodexPacketPlanner:
         task: OrchestratorTask,
         artifact_log: str | Path,
         executable: str = "codex",
-        run: RunProcess = subprocess.run,
+        timeout: float = 45.0,
+        env: Mapping[str, str] | None = None,
+        run: RunProcess = _run_process_group,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("planner timeout must be positive")
         self._model = model
         self._task = task
         self._artifact_log = Path(artifact_log)
         self._executable = executable
+        self._timeout = timeout
+        self._env = None if env is None else dict(env)
         self._run = run
 
     def __call__(self, prompt: str, model: str) -> tuple[str, int]:
@@ -418,7 +467,26 @@ class CodexPacketPlanner:
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=self._timeout,
+                    env=self._env,
                 )
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+                _append_jsonl(
+                    self._artifact_log,
+                    {
+                        "ts": started,
+                        "prompt": prompt,
+                        "model": model,
+                        "exit_code": None,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "parse_status": "timeout",
+                        "timeout_seconds": self._timeout,
+                    },
+                )
+                raise TimeoutError(f"Codex planner timed out after {self._timeout:.2f}s") from exc
             except OSError as exc:
                 _append_jsonl(
                     self._artifact_log,
@@ -535,6 +603,26 @@ def wait_for_external_ref(
         time.sleep(min(max(poll_interval, 0.0), remaining))
 
 
+def acquire_exclusive_lock(
+    lock_stream: IO[str], *, timeout: float, poll_interval: float = 0.05
+) -> float:
+    """Acquire an advisory lock without allowing a dead leader to hang followers."""
+
+    if timeout <= 0:
+        raise ValueError("lock timeout must be positive")
+    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return time.monotonic() - started
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"RRC packet lock timed out after {timeout:.2f}s") from exc
+            time.sleep(min(max(poll_interval, 0.0), remaining))
+
+
 def _result_payload(result: AssignmentResolution) -> dict[str, object]:
     return {
         "task_id": result.task_id,
@@ -555,15 +643,23 @@ def _resolve_cli(args: argparse.Namespace) -> int:
         model=args.model,
         task=task,
         artifact_log=args.model_events,
+        timeout=args.planner_timeout,
+        env={
+            **os.environ,
+            **(
+                {"CODEX_HOME": str(args.planner_codex_home)}
+                if args.planner_codex_home is not None
+                else {}
+            ),
+        },
     )
     case_index = RoundCaseIndex(args.everos_url, args.round_id)
-    started = time.monotonic()
     try:
         if args.mode == "warm":
             Path(args.lock).parent.mkdir(parents=True, exist_ok=True)
             with Path(args.lock).open("a+") as lock_stream:
-                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
-                lock_wait_ms = round((time.monotonic() - started) * 1000)
+                lock_wait = acquire_exclusive_lock(lock_stream, timeout=args.lock_timeout)
+                lock_wait_ms = round(lock_wait * 1000)
                 store: PacketStore = SQLiteTemplateStore(args.database)
                 result = resolve_assignment(
                     task_id=args.task_id,
@@ -575,7 +671,12 @@ def _resolve_cli(args: argparse.Namespace) -> int:
                     planner_model=args.model,
                 )
                 if not result.hit:
-                    wait_for_external_ref(case_index, result.case_shape, result.external_ref)
+                    wait_for_external_ref(
+                        case_index,
+                        result.case_shape,
+                        result.external_ref,
+                        timeout=args.visibility_timeout,
+                    )
         else:
             lock_wait_ms = 0
             store = _NoopPacketStore()
@@ -611,7 +712,7 @@ def _resolve_cli(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    resolve = commands.add_parser("resolve", help="resolve one OpenCode worker audit packet")
+    resolve = commands.add_parser("resolve", help="resolve one Codex worker audit packet")
     resolve.add_argument("--mode", choices=("cold", "warm"), required=True)
     resolve.add_argument("--round-id", required=True)
     resolve.add_argument("--task-id", required=True)
@@ -622,6 +723,26 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--model-events", type=Path, required=True)
     resolve.add_argument("--model", required=True)
     resolve.add_argument("--everos-url", required=True)
+    resolve.add_argument(
+        "--planner-timeout",
+        type=float,
+        default=float(os.environ.get("RRC_PLANNER_TIMEOUT", "45")),
+    )
+    resolve.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=float(os.environ.get("RRC_LOCK_TIMEOUT", "45")),
+    )
+    resolve.add_argument(
+        "--visibility-timeout",
+        type=float,
+        default=float(os.environ.get("RRC_VISIBILITY_TIMEOUT", "30")),
+    )
+    resolve.add_argument(
+        "--planner-codex-home",
+        type=Path,
+        default=os.environ.get("RRC_PLANNER_CODEX_HOME"),
+    )
     return parser
 
 

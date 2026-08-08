@@ -162,20 +162,22 @@ press Enter on both. The live meter reads the current round only (from
 ## Combined ContextMesh + ReasonRenderCoding multi-agent demo
 
 `RRDdemo.sh` mirrors the three-terminal `demo.sh` experience but tests the two
-systems together. Both arms select the real OpenCode `orchestrator`, expose the
-`worker` subagent, and load both plugins. The canonical four-handler audit
-causes four foreground `task` calls in one assistant turn:
+systems together using the **Codex CLI** and the Ollama Responses API. Both
+arms use round-local `CODEX_HOME` directories, advertise a native `worker` role,
+and allow four concurrent subagents. Codex obtains the key from the
+`OLLAMA_API_KEY` environment variable; it neither reads the user's normal Codex
+provider configuration nor requires `codex login`.
 
-1. `plugin/reasonrendercoding.ts` intercepts each task before execution and
-   resolves a validated read-only Plan + Spec through
-   `rrc.orchestrator_runtime.OrchestratorRuntime`.
-2. The actual OpenCode worker receives its original audit assignment plus the
-   rendered RRC packet.
-3. `plugin/contextmesh.ts` serves shared-file digests inside the worker and can
-   compress the completed worker result before the orchestrator merges it.
+1. A Codex `PreToolUse` hook validates each one-handler assignment, resolves a
+   bounded RRC packet, and delivers the packet plus current handler bytes.
+2. A `SubagentStart` hook authenticates and delivers summaries of
+   `src/models.js`, `src/utils.js`, and `src/middleware.js` from the sealed seed.
+3. A loopback Responses adapter preserves oversized raw worker reports locally
+   and replaces a result only after bounded summarization succeeds. Any failure
+   forwards the original upstream stream unchanged.
 
 Side A is RRC **COLD**: all four worker packets require planner calls. Side B is
-RRC **WARM**: a short round-local lock makes the first packet a MISS, waits
+RRC **WARM**: a bounded round-local lock makes the first packet a MISS, waits
 until its exact EverOS `external_ref` is visible, then the three sibling tasks
 reuse it from EverOS + SQLite with zero planner tokens. The lock covers packet
 resolution only; it is released before each real worker starts.
@@ -188,20 +190,21 @@ cd contextmesh
 # terminal 3:  ./RRDdemo.sh meter   # combined token/reuse/context display
 ```
 
-Paste the prompt copied by `prep` into both TUIs. `RRD-demo-prompt.txt` is kept
-byte-identical to `demo-prompt.txt`, so the ordinary and combined website demos
-cannot drift. Set `RRC_MODEL` to override the Codex planner model read from
-`~/.codex/config.toml`. The launcher performs the same Tollgate/EverOS health
-checks as `demo.sh`; a dead service fails before OpenCode's opaque API retry
-loop.
+`prep` performs local preflight and then makes model-backed seed summaries, so it
+can consume Ollama tokens. Paste the copied `RRD-demo-prompt.txt` into both Codex
+TUIs. The combined prompt is intentionally Codex-native and therefore is not
+byte-identical to the ordinary OpenCode prompt. Set `RRC_STRONG_MODEL` (or
+`RRC_MODEL`) to override the default RRC planner model. Run
+`./RRDdemo.sh canary` for an optional live connectivity request; it also consumes
+tokens.
 
-Per-arm evidence lives in `runs/rrd-demo/<round>/{a,b}/`: `opencode.db` for the
-real parent/worker sessions, `contextmesh.jsonl` for digest/result events,
-`rrc-events.jsonl` for MISS/HIT/fail-open events, `rrc-model-events.jsonl` for
-raw Codex planner evidence, and `plan-spec.sqlite` for exact WARM packets. The
-meter treats Tollgate as the sole OpenCode token authority, adds disjoint Codex
-planner usage, and displays ContextMesh savings separately as counterfactual
-tokens rather than double-counting them.
+The dedicated RRD Tollgate is `:8789`, the fail-open Responses adapter is
+`:8790`, and ordinary `demo.sh` remains on `:8788`. Per-arm evidence lives in
+`runs/rrd-demo/<round>/{a,b}/`: `hook-events.jsonl`, `proxy-events.jsonl`,
+`rrc-events.jsonl`, `rrc-model-events.jsonl`, `seed-manifest.json`, preserved
+raw results, and `plan-spec.sqlite`. The meter uses exact Tollgate rows as its
+sole additive authority, shows setup separately, labels one COLD/WARM pair
+non-causal, and never subtracts counterfactual ContextMesh savings from totals.
 
 ## Demo-day flow
 

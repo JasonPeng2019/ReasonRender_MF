@@ -172,7 +172,7 @@ def test_report_distinguishes_bad_spec_tests_from_bad_implementation(tmp_path: P
 
 
 @pytest.mark.parametrize("side", ["a", "b"])
-def test_shell_sides_launch_the_opencode_tui(tmp_path: Path, side: str) -> None:
+def test_shell_sides_launch_the_codex_tui(tmp_path: Path, side: str) -> None:
     root = tmp_path / "repo"
     contextmesh = root / "contextmesh"
     scripts = contextmesh / "scripts"
@@ -180,7 +180,7 @@ def test_shell_sides_launch_the_opencode_tui(tmp_path: Path, side: str) -> None:
     copied_script = contextmesh / "RRDdemo.sh"
     copied_script.write_bytes(SCRIPT.read_bytes())
     copied_script.chmod(0o755)
-    start = scripts / "start_stack.sh"
+    start = scripts / "rrd_start_stack.sh"
     start.write_text("#!/bin/sh\nexit 0\n")
     start.chmod(0o755)
     calls = tmp_path / "tui-calls"
@@ -204,13 +204,33 @@ def test_shell_sides_launch_the_opencode_tui(tmp_path: Path, side: str) -> None:
     assert calls.read_text() == f"{side}\n"
 
 
-def test_rrd_script_describes_the_same_three_terminal_tui_flow() -> None:
+def test_rrd_script_describes_the_same_three_terminal_codex_tui_flow() -> None:
     script = SCRIPT.read_text()
 
-    assert "open the COLD opencode TUI" in script
-    assert "open the WARM opencode TUI" in script
+    assert "open the COLD Codex TUI" in script
+    assert "open the WARM Codex TUI" in script
     assert 'exec "$ROOT/scripts/rrd_demo_tui.sh" "$cmd"' in script
     assert "headless" not in script.lower()
+
+
+def test_rrd_prompt_uses_codex_native_worker_language() -> None:
+    prompt = (SCRIPT.parent / "RRD-demo-prompt.txt").read_text()
+
+    assert "Spawn ONE worker subagent per handler file" in prompt
+    assert "launch them in parallel" in prompt
+    assert "wait for all four" in prompt.lower()
+    assert "task tool" not in prompt
+    assert "subagent_type" not in prompt
+
+
+def test_contextmesh_shared_read_key_is_identical_for_store_and_reread_lookup() -> None:
+    plugin = (SCRIPT.parent / "plugin/contextmesh.ts").read_bytes()
+
+    assert b"\x00" not in plugin
+    text = plugin.decode()
+    assert "function sharedReadKey(" in text
+    assert text.count("sharedReadKey(input.sessionID, filePath || envelopePath)") == 1
+    assert text.count("sharedReadKey(input.sessionID, filePath)") == 2
 
 
 def test_rrd_prep_resets_seeds_and_copies_the_audit_prompt(tmp_path: Path) -> None:
@@ -221,7 +241,7 @@ def test_rrd_prep_resets_seeds_and_copies_the_audit_prompt(tmp_path: Path) -> No
     prompt = "four-worker canonical audit\n"
     (root / "RRD-demo-prompt.txt").write_text(prompt)
     events = tmp_path / "events"
-    (scripts / "start_stack.sh").write_text('#!/bin/sh\necho start >> "$RRC_PREP_EVENTS"\n')
+    (scripts / "rrd_start_stack.sh").write_text('#!/bin/sh\necho start >> "$RRC_PREP_EVENTS"\n')
     (scripts / "rrd_demo_tui.sh").write_text(
         "#!/bin/sh\n"
         'echo "$1" >> "$RRC_PREP_EVENTS"\n'
@@ -264,88 +284,86 @@ def test_rrd_prep_resets_seeds_and_copies_the_audit_prompt(tmp_path: Path) -> No
     assert (root / "runs/RRD-demo-prompt.txt").read_text() == prompt
 
 
-def test_rrd_opencode_assets_are_present_and_wired_to_the_real_pipeline() -> None:
+def test_rrd_codex_assets_are_present_and_wired_to_the_real_pipeline() -> None:
     repo = SCRIPT.parents[1]
     launcher = (repo / "contextmesh/scripts/rrd_demo_tui.sh").read_text()
     wrapper = (repo / "contextmesh/RRDdemo.sh").read_text()
-    plugin = (repo / "contextmesh/plugin/reasonrendercoding.ts").read_text()
+    hook = (repo / "contextmesh/scripts/rrd_codex_hook.py").read_text()
     prompt = (repo / "contextmesh/RRD-demo-prompt.txt").read_text()
-    canonical_prompt = (repo / "contextmesh/demo-prompt.txt").read_text()
-    config_a = json.loads((repo / "contextmesh/configs/rrd-arm-a.json").read_text())
-    config_b = json.loads((repo / "contextmesh/configs/rrd-arm-b.json").read_text())
 
-    assert 'exec "$OC"' in launcher
-    assert 'OPENCODE_CONFIG="$ROOT/configs/rrd-arm-$ARM.json"' in launcher
-    assert 'RRC_DEMO_MODE="$MODE"' in launcher
-    assert 'CONTEXTMESH_PLUGIN_PATH="file://$ROOT/plugin/contextmesh.ts"' in launcher
-    assert "python -m rrc.multiagent_demo resolve" in plugin
-    assert 'input.tool !== "task"' in plugin
-    assert "output.args.prompt =" in plugin
-    assert "fail_open" in plugin
-    assert "reasonrender_coding" not in plugin
+    assert 'exec "$CODEX_BIN" --dangerously-bypass-hook-trust' in launcher
+    assert 'env_key = "OLLAMA_API_KEY"' in launcher
+    assert 'wire_api = "responses"' in launcher
+    assert "multi_agent_v2 = false" in launcher
+    assert "plugins = false" in launcher
+    assert "[agents.worker]" in launcher
+    assert '"$ROUND_DIR/bundle/rrd_codex_hook.py" 8790' in launcher
+    assert 'CODEX_HOME="$DEMO/codex-home"' in launcher
+    assert "opencode" not in launcher.lower()
+    assert "codex login" not in launcher.lower()
+    assert "rrc.multiagent_demo" in hook
+    assert 'payload.get("hook_event_name")' in hook
+    assert "SubagentStart" in hook and "SubagentStop" in hook
+    assert "fail_open" in hook
     assert wrapper.index('"$ROOT/scripts/rrd_demo_preflight.sh"') < wrapper.index(
         '"$ROOT/scripts/rrd_demo_tui.sh" reset'
     )
     assert 'rrd_demo_preflight.sh" || true' not in wrapper
-    assert prompt == canonical_prompt
     assert "ONE worker subagent per handler" in prompt
-    for config in (config_a, config_b):
-        assert config["default_agent"] == "orchestrator"
-        assert config["subagent_depth"] == 1
-        assert config["agent"]["worker"]["mode"] == "subagent"
-        assert "all four" in config["agent"]["orchestrator"]["prompt"].lower()
-        assert config["plugin"] == [
-            "{env:CONTEXTMESH_PLUGIN_PATH}",
-            "{env:RRC_PLUGIN_PATH}",
-        ]
 
 
 @pytest.mark.parametrize(("side", "mode"), [("a", "cold"), ("b", "warm")])
-def test_rrd_tui_reaches_the_real_opencode_entrypoint(tmp_path: Path, side: str, mode: str) -> None:
+def test_rrd_tui_reaches_the_real_codex_entrypoint(tmp_path: Path, side: str, mode: str) -> None:
     root = tmp_path / "contextmesh"
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(TUI_SCRIPT, scripts / "rrd_demo_tui.sh")
+    shutil.copy2(SCRIPT.parent / "scripts/rrd_codex_hook.py", scripts / "rrd_codex_hook.py")
     (root / ".env.local").write_text(
-        "OLLAMA_API_KEY=test-key\nCONTEXTMESH_MODEL=test-outer-model\n"
+        "OLLAMA_API_KEY=test-key\nCONTEXTMESH_MODEL=test-ollama-model\n"
     )
-    (root / "configs").mkdir()
-    (root / "configs" / f"rrd-arm-{side}.json").write_text("{}\n")
     template = root / "bench" / "target-template"
     template.mkdir(parents=True)
     (template / "README.md").write_text("demo\n")
     (root / "RRD-demo-prompt.txt").write_text("website prompt\n")
-    runs = root / "runs" / "rrd-demo"
-    runs.mkdir(parents=True)
-    (runs / "round").write_text("rrd-test\n")
-    (runs / "rrd-test").mkdir()
-    (runs / "rrd-test/.combined-multiagent-v1").touch()
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    for name in ("curl", "codex", "uv"):
+    for name in ("curl", "uv"):
         executable = fake_bin / name
         executable.write_text("#!/bin/sh\nexit 0\n")
         executable.chmod(0o755)
-    marker = tmp_path / "opencode-env"
-    opencode = fake_bin / "opencode"
-    opencode.write_text(
+    marker = tmp_path / "codex-env"
+    codex = fake_bin / "codex"
+    codex.write_text(
         "#!/bin/sh\n"
-        'if [ "${1:-}" = "--version" ]; then echo 1.18.15; exit 0; fi\n'
-        'printf "%s|%s|%s|%s\\n" "$RRC_DEMO_MODE" "$OPENCODE_CONFIG" '
-        '"$RRC_PLUGIN_PATH" "$CONTEXTMESH_PLUGIN_PATH" > "$RRC_TUI_MARKER"\n'
+        'if [ "${1:-}" = "--version" ]; then echo codex-cli-test; exit 0; fi\n'
+        'printf "%s|%s|%s|%s\\n" "$RRC_DEMO_MODE" "$CODEX_HOME" '
+        '"$RRC_PLANNER_CODEX_HOME" "$*" > "$RRC_TUI_MARKER"\n'
         "exit 73\n"
     )
-    opencode.chmod(0o755)
+    codex.chmod(0o755)
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
-            "CONTEXTMESH_OPENCODE_BIN": str(opencode),
-            "RRC_STRONG_MODEL": "test-inner-model",
+            "RRD_CODEX_BIN": str(codex),
             "RRC_TUI_MARKER": str(marker),
         }
     )
+
+    reset = subprocess.run(
+        [scripts / "rrd_demo_tui.sh", "reset"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert reset.returncode == 0, reset.stderr
+    round_id = (root / "runs/rrd-demo/round").read_text().strip()
+    (root / f"runs/rrd-demo/{round_id}/.seeded").touch()
 
     result = subprocess.run(
         [scripts / "rrd_demo_tui.sh", side],
@@ -358,9 +376,17 @@ def test_rrd_tui_reaches_the_real_opencode_entrypoint(tmp_path: Path, side: str,
     )
 
     assert result.returncode == 73
-    assert f"side {side} ({mode.upper()}, session: rrd-demo-rrd-test-{side})" in result.stdout
-    recorded_mode, config, plugin, contextmesh_plugin = marker.read_text().strip().split("|")
+    assert f"side {side} ({mode.upper()}, session: rrd-demo-{round_id}-{side})" in result.stdout
+    recorded_mode, codex_home, planner_home, arguments = marker.read_text().strip().split("|")
     assert recorded_mode == mode
-    assert config == str(root / "configs" / f"rrd-arm-{side}.json")
-    assert plugin == f"file://{root}/plugin/reasonrendercoding.ts"
-    assert contextmesh_plugin == f"file://{root}/plugin/contextmesh.ts"
+    assert codex_home == str(root / f"runs/rrd-demo/{round_id}/{side}/codex-home")
+    assert planner_home == str(root / f"runs/rrd-demo/{round_id}/{side}/planner-home")
+    assert arguments == "--dangerously-bypass-hook-trust"
+    config = (Path(codex_home) / "config.toml").read_text()
+    assert 'env_key = "OLLAMA_API_KEY"' in config
+    assert 'wire_api = "responses"' in config
+    assert "[agents.worker]" in config
+    assert "plugins = false" in config
+    assert ":8790/ollama/" in config
+    assert "test-key" not in config
+    assert "opencode" not in config.lower()

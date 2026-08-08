@@ -1,38 +1,76 @@
 #!/usr/bin/env bash
-# Preflight for the combined ContextMesh + ReasonRenderCoding worker demo.
+# Local preflight for the Codex + Ollama ContextMesh/RRC demo.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/.env.local"
 fail=0
+CODEX_BIN="${RRD_CODEX_BIN:-codex}"
+PREFLIGHT_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/rrd-codex-preflight.XXXXXX")" || {
+  echo "FAIL  could not create isolated Codex preflight home" >&2
+  exit 1
+}
+trap 'rm -rf "$PREFLIGHT_CODEX_HOME"' EXIT
 
 check() {
   local name="$1"; shift
   if "$@" >/dev/null 2>&1; then echo "PASS  $name"; else echo "FAIL  $name"; fail=1; fi
 }
 
-check "tollgate :8788 healthz" curl -sf -m 5 http://127.0.0.1:8788/healthz
-check "everos :8000 health" curl -sf -m 5 http://127.0.0.1:8000/health
-check "Ollama API key is configured" test -n "${OLLAMA_API_KEY:-}"
-check "Codex CLI is installed" command -v codex
-check "Codex CLI is authenticated" codex login status
+# Invoked indirectly through check().
+# shellcheck disable=SC2329
+codex_version_ok() {
+  test "$("$CODEX_BIN" --version)" = "codex-cli 0.147.0"
+}
+
+# shellcheck disable=SC2329
+codex_feature_enabled() {
+  local features
+  features="$(CODEX_HOME="$PREFLIGHT_CODEX_HOME" "$CODEX_BIN" features list)" || return
+  grep -Eq "^$1[[:space:]]+stable[[:space:]]+true" <<<"$features"
+}
+
+# shellcheck disable=SC2329
+prompt_is_codex_native() {
+  ! grep -Eq "task tool|subagent_type" "$ROOT/RRD-demo-prompt.txt"
+}
+
+check "RRD Tollgate :8789 healthz" curl -sf -m 5 http://127.0.0.1:8789/healthz
+check "RRD response proxy :8790 healthz" curl -sf -m 5 http://127.0.0.1:8790/healthz
+check "EverOS :8000 health" curl -sf -m 5 http://127.0.0.1:8000/health
+check "OLLAMA_API_KEY is configured" test -n "${OLLAMA_API_KEY:-}"
+check "CONTEXTMESH_MODEL is configured" test -n "${CONTEXTMESH_MODEL:-}"
+check "Codex CLI is installed" command -v "$CODEX_BIN"
+check "Codex CLI matches tested 0.147.0 wire contract" codex_version_ok
 check "uv is installed" command -v "${RRC_DEMO_UV_BIN:-uv}"
-check "combined audit prompt is canonical" cmp -s "$ROOT/RRD-demo-prompt.txt" "$ROOT/demo-prompt.txt"
-check "ContextMesh plugin is present" test -f "$ROOT/plugin/contextmesh.ts"
-check "RRC task-augmentation plugin is present" test -f "$ROOT/plugin/reasonrendercoding.ts"
-check "Ollama Cloud auth + OpenCode model" \
-  curl -sf -m 60 https://ollama.com/v1/chat/completions \
-    -H "Authorization: Bearer $OLLAMA_API_KEY" -H "Content-Type: application/json" \
-    -d "{\"model\":\"$CONTEXTMESH_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}"
-OC="${CONTEXTMESH_OPENCODE_BIN:-opencode}"
-OCVER="$("$OC" --version 2>/dev/null || true)"
-case "$OCVER" in
-  1.1[89].*|1.2[0-9].*|[2-9].*) echo "PASS  opencode binary is $OCVER (renders TUI, loads both plugins)" ;;
-  *) echo "FAIL  opencode binary is '$OCVER' — need 1.18.15+"; fail=1 ;;
-esac
+check "Codex hooks feature is available" codex_feature_enabled hooks
+check "Codex multi-agent feature is available" codex_feature_enabled multi_agent
+check "Codex hook adapter is present" test -f "$ROOT/scripts/rrd_codex_hook.py"
+check "Codex-native audit prompt has no OpenCode task syntax" prompt_is_codex_native
+
+if [ "${1:-}" = "--canary" ]; then
+  echo "Running one optional live Ollama Responses canary (this consumes a few tokens)…"
+  if OLLAMA_API_KEY="$OLLAMA_API_KEY" CONTEXTMESH_MODEL="$CONTEXTMESH_MODEL" python3 - <<'PY'
+import json, os, urllib.request
+request=urllib.request.Request(
+    "http://127.0.0.1:8789/ollama/setup-canary-root/v1/responses",
+    data=json.dumps({"model":os.environ["CONTEXTMESH_MODEL"],"input":"Reply with OK.","stream":False,"max_output_tokens":8}).encode(),
+    headers={"Authorization":"Bearer "+os.environ["OLLAMA_API_KEY"],"Content-Type":"application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=60) as response:
+    body=json.loads(response.read())
+if not isinstance(body, dict) or not body.get("id"):
+    raise SystemExit("response lacked an id")
+print("PASS  Ollama Responses canary")
+PY
+  then :; else
+    echo "FAIL  Ollama Responses canary"; fail=1
+  fi
+fi
 
 if [ "$fail" = 0 ]; then
-  echo "ALL GREEN — services/auth/config ready for the four-worker combined demo."
+  echo "ALL GREEN — Codex uses the custom Ollama provider; codex login is not required."
 else
   echo "NOT READY — fix FAILs above, then rerun $ROOT/RRDdemo.sh prep."
 fi

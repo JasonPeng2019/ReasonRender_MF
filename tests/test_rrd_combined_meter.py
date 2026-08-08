@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import sqlite3
+import os
+import time
 from pathlib import Path
+
+HANDLERS = ("users", "products", "orders", "reviews")
+SHARED = ("src/models.js", "src/utils.js", "src/middleware.js")
 
 
 def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -10,248 +15,320 @@ def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
-def _db(path: Path, workers: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path)
-    db.execute("CREATE TABLE session (id TEXT, parent_id TEXT)")
-    db.execute("INSERT INTO session VALUES ('root', NULL)")
-    db.executemany(
-        "INSERT INTO session VALUES (?, 'root')",
-        [(f"worker-{index}",) for index in range(workers)],
-    )
-    db.commit()
-    db.close()
-
-
-def test_combined_meter_uses_disjoint_token_authorities(tmp_path: Path) -> None:
-    from contextmesh.scripts.rrd_combined_meter import collect
-
-    round_id = "rrd-test"
-    _jsonl(
-        tmp_path / "runs/tokens.jsonl",
-        [
+def _valid_arm(root: Path, round_id: str, side: str) -> None:
+    arm = root / f"runs/rrd-demo/{round_id}/{side}"
+    target = arm / "target"
+    (target / "src/handlers").mkdir(parents=True)
+    handler_hashes: dict[str, str] = {}
+    for handler in HANDLERS:
+        path = target / f"src/handlers/{handler}.js"
+        path.write_text(f"export const {handler} = true\n")
+        handler_hashes[handler] = hashlib.sha256(path.read_bytes()).hexdigest()
+    shared_hashes: dict[str, tuple[str, str]] = {}
+    manifest_rows: list[dict[str, object]] = []
+    for path_string in SHARED:
+        path = target / path_string
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"export const source = '{path_string}'\n" * 200)
+        raw_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest_hash = hashlib.sha256(f"digest:{path_string}".encode()).hexdigest()
+        shared_hashes[path_string] = (raw_hash, digest_hash)
+        manifest_rows.append(
             {
-                "session": f"rrd-demo-{round_id}-a",
-                "measurement_state": "exact",
-                "input_tokens": 800,
-                "output_tokens": 200,
-            },
-            {
-                "session": f"rrd-demo-{round_id}-a-summarizer",
-                "measurement_state": "exact",
-                "input_tokens": 50,
-                "output_tokens": 50,
-            },
-            {
-                "session": f"rrd-demo-{round_id}-b",
-                "measurement_state": "exact",
-                "input_tokens": 700,
-                "output_tokens": 200,
-            },
-            {
-                "session": "unrelated-session",
-                "measurement_state": "estimated",
-                "input_tokens": 9999,
-                "output_tokens": 9999,
-            },
-        ],
-    )
-    for side, rows in {
-        "a": [{"event": "packet", "branch": "miss", "planner_tokens": 100} for _ in range(4)],
-        "b": [
-            {"event": "packet", "branch": "miss", "planner_tokens": 100},
-            *[{"event": "packet", "branch": "hit", "planner_tokens": 0} for _ in range(3)],
-        ],
-    }.items():
-        arm = tmp_path / f"runs/rrd-demo/{round_id}/{side}"
-        _jsonl(arm / "rrc-events.jsonl", rows)
-        planner_calls = 4 if side == "a" else 1
-        _jsonl(
-            arm / "rrc-model-events.jsonl",
-            [{"parse_status": "ok", "usage": {"total_tokens": 100}} for _ in range(planner_calls)],
-        )
-        _jsonl(
-            arm / "contextmesh.jsonl",
-            [
-                {"event": "plugin_loaded"},
-                *[
-                    {
-                        "event": "digest_hit",
-                        "sessionID": f"worker-{index}",
-                        "savedTokens": 125,
-                    }
-                    for index in range(4)
-                ],
-                {"event": "task_compressed"},
-            ],
-        )
-        _db(arm / "opencode.db", workers=4)
-
-    snapshot = collect(round_id, root=tmp_path)
-
-    assert snapshot["a"]["opencode_tokens"] == 1100
-    assert snapshot["a"]["planner_tokens"] == 400
-    assert snapshot["a"]["combined_tokens"] == 1500
-    assert snapshot["b"]["opencode_tokens"] == 900
-    assert snapshot["b"]["planner_tokens"] == 100
-    assert snapshot["b"]["combined_tokens"] == 1000
-    assert snapshot["a"]["workers"] == snapshot["b"]["workers"] == 4
-    assert snapshot["b"]["misses"] == 1 and snapshot["b"]["hits"] == 3
-    assert snapshot["b"]["digest_saved"] == 500
-    assert snapshot["b"]["digest_worker_sessions"] == 4
-    assert snapshot["b"]["plugin_loaded"] == 1
-    assert snapshot["b"]["task_compressed"] == 1
-    assert snapshot["a"]["ready"] == snapshot["b"]["ready"] == 1
-
-
-def test_failed_packet_still_counts_planner_usage_and_one_failure(tmp_path: Path) -> None:
-    from contextmesh.scripts.rrd_combined_meter import collect
-
-    round_id = "rrd-failed"
-    arm = tmp_path / f"runs/rrd-demo/{round_id}/a"
-    _jsonl(
-        tmp_path / "runs/tokens.jsonl",
-        [
-            {
-                "session": f"rrd-demo-{round_id}-a",
-                "measurement_state": "exact",
-                "input_tokens": 10,
-                "output_tokens": 5,
+                "path": path_string,
+                "raw_sha256": raw_hash,
+                "digest_sha256": digest_hash,
+                "raw_chars": 4000,
+                "digest_chars": 1000,
             }
-        ],
+        )
+    target_stat = target.resolve().stat()
+    manifest: dict[str, object] = {
+        "v": 1,
+        "round_id": round_id,
+        "arm": side,
+        "target_root": str(target.resolve()),
+        "target_device": target_stat.st_dev,
+        "target_inode": target_stat.st_ino,
+        "files": manifest_rows,
+    }
+    serialized = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest["seal"] = hashlib.sha256(serialized.encode()).hexdigest()
+    (arm / "seed-manifest.json").write_text(json.dumps(manifest))
+    hooks: list[dict[str, object]] = []
+    compression_receipt = "a" * 20
+    for index, handler in enumerate(HANDLERS):
+        tool = f"call-{handler}"
+        agent = f"agent-{handler}"
+        hooks.extend(
+            [
+                {
+                    "event": "assignment",
+                    "ts": 1 + index * 0.01,
+                    "assignment_id": f"assignment-{handler}",
+                    "tool_use_id": tool,
+                    "handler": f"src/handlers/{handler}.js",
+                    "handler_sha256": handler_hashes[handler],
+                },
+                {"event": "spawned", "ts": 2, "tool_use_id": tool, "agent_id": agent},
+                {
+                    "event": "shared_context",
+                    "ts": 3 + index * 0.01,
+                    "agent_id": agent,
+                    "receipts": [
+                        {
+                            "path": path,
+                            "hit": True,
+                            "raw_sha256": shared_hashes[path][0],
+                            "digest_sha256": shared_hashes[path][1],
+                        }
+                        for path in SHARED
+                    ],
+                },
+                {
+                    "event": "result_final",
+                    "ts": 8 + index * 0.01,
+                    "agent_id": agent,
+                    "compressed": index == 0,
+                    "compression_receipt": compression_receipt if index == 0 else None,
+                    "delivered_chars": len(f"report-{agent}"),
+                    "delivered_sha256": hashlib.sha256(f"report-{agent}".encode()).hexdigest(),
+                },
+            ]
+        )
+    hooks.extend(
+        [
+            {
+                "event": "wait_result",
+                "ts": 9,
+                "agent_ids": [f"agent-{name}" for name in HANDLERS],
+                "completed_agent_ids": [f"agent-{name}" for name in HANDLERS],
+                "completed_results": {
+                    f"agent-{name}": {
+                        "chars": len(f"report-agent-{name}"),
+                        "sha256": hashlib.sha256(f"report-agent-{name}".encode()).hexdigest(),
+                    }
+                    for name in HANDLERS
+                },
+                "result_count": 4,
+                "timed_out": False,
+            },
+            {"event": "root_merge", "ts": 10, "chars": 500, "sha256": "d" * 64},
+        ]
     )
+    _jsonl(arm / "hook-events.jsonl", hooks)
     _jsonl(
-        arm / "rrc-model-events.jsonl",
-        [{"parse_status": "ok", "usage": {"total_tokens": 321}}],
+        arm / "proxy-events.jsonl",
+        [{"event": "result_compress", "receipt": compression_receipt, "ts": 7}],
     )
+    branches = ["miss"] * 4 if side == "a" else ["miss", "hit", "hit", "hit"]
     _jsonl(
         arm / "rrc-events.jsonl",
         [
-            {"event": "fail_open", "failure_id": "round-call-1", "source": "python"},
             {
-                "event": "fail_open",
-                "failure_id": "round-call-1",
-                "source": "opencode_plugin",
-            },
-        ],
-    )
-
-    snapshot = collect(round_id, root=tmp_path)["a"]
-
-    assert snapshot["planner_tokens"] == 321
-    assert snapshot["combined_tokens"] == 336
-    assert snapshot["fail_open"] == 1
-    assert snapshot["ready"] == 0
-
-
-def test_inexact_arm_traffic_makes_the_comparison_not_ready(tmp_path: Path) -> None:
-    from contextmesh.scripts.rrd_combined_meter import collect
-
-    round_id = "rrd-inexact"
-    _jsonl(
-        tmp_path / "runs/tokens.jsonl",
-        [
-            {
-                "session": f"rrd-demo-{round_id}-a",
-                "measurement_state": "estimated",
-                "input_tokens": 10,
-                "output_tokens": 5,
+                "event": "packet",
+                "branch": branch,
+                "task_id": f"assignment-{handler}",
+                "handler": f"src/handlers/{handler}.js",
             }
+            for handler, branch in zip(HANDLERS, branches, strict=True)
         ],
     )
 
-    snapshot = collect(round_id, root=tmp_path)["a"]
 
-    assert snapshot["inexact_records"] == 1
-    assert snapshot["ready"] == 0
-
-
-def test_missing_contextmesh_evidence_makes_complete_rrc_arms_not_ready(tmp_path: Path) -> None:
-    from contextmesh.scripts.rrd_combined_meter import collect
-
-    round_id = "rrd-no-contextmesh"
-    _jsonl(
-        tmp_path / "runs/tokens.jsonl",
-        [
-            {
-                "session": f"rrd-demo-{round_id}-{side}",
-                "measurement_state": "exact",
-                "input_tokens": 10,
-                "output_tokens": 5,
-            }
-            for side in ("a", "b")
-        ],
-    )
+def _valid_round(root: Path, round_id: str = "rrd-test") -> None:
+    rows: list[dict[str, object]] = []
     for side in ("a", "b"):
-        arm = tmp_path / f"runs/rrd-demo/{round_id}/{side}"
-        branches = ["miss"] * 4 if side == "a" else ["miss", "hit", "hit", "hit"]
-        _jsonl(
-            arm / "rrc-events.jsonl",
-            [{"event": "packet", "branch": branch} for branch in branches],
+        rows.extend(
+            [
+                {
+                    "session": f"rrd-demo-{round_id}-{side}-outer",
+                    "measurement_state": "exact",
+                    "input_tokens": 800 if side == "a" else 700,
+                    "output_tokens": 200,
+                },
+                {
+                    "session": f"rrd-demo-{round_id}-{side}-summarizer",
+                    "measurement_state": "exact",
+                    "input_tokens": 50,
+                    "output_tokens": 25,
+                },
+                {
+                    "session": f"rrd-demo-{round_id}-{side}-planner",
+                    "measurement_state": "exact",
+                    "input_tokens": 400 if side == "a" else 100,
+                    "output_tokens": 40 if side == "a" else 10,
+                },
+            ]
         )
-        _jsonl(arm / "rrc-model-events.jsonl", [])
-        _db(arm / "opencode.db", workers=4)
+        _valid_arm(root, round_id, side)
+    rows.append(
+        {
+            "session": f"rrd-demo-{round_id}-setup-seed-a",
+            "measurement_state": "exact",
+            "input_tokens": 50,
+            "output_tokens": 10,
+        }
+    )
+    _jsonl(root / "runs/rrd-tokens.jsonl", rows)
 
-    snapshot = collect(round_id, root=tmp_path)
 
-    assert snapshot["a"]["ready"] == snapshot["b"]["ready"] == 0
-    assert snapshot["a"]["plugin_loaded"] == snapshot["b"]["plugin_loaded"] == 0
-    assert snapshot["a"]["digest_worker_sessions"] == 0
+def test_codex_meter_correlates_evidence_and_uses_disjoint_tollgate_totals(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    snapshot = collect("rrd-test", root=tmp_path)
+
+    assert snapshot["a"]["outer_tokens"] == 1000
+    assert snapshot["a"]["summarizer_tokens"] == 75
+    assert snapshot["a"]["planner_tokens"] == 440
+    assert snapshot["a"]["combined_tokens"] == 1515
+    assert snapshot["b"]["combined_tokens"] == 1085
+    assert snapshot["a"]["setup_tokens"] == snapshot["b"]["setup_tokens"] == 60
+    assert snapshot["a"]["workers"] == snapshot["b"]["workers"] == 4
+    assert snapshot["a"]["overlap"] == snapshot["b"]["overlap"] == 1
+    assert snapshot["b"]["misses"] == 1 and snapshot["b"]["hits"] == 3
+    assert snapshot["a"]["digest_worker_sessions"] == 4
+    assert snapshot["a"]["results"] == 4
+    assert snapshot["a"]["ready"] == snapshot["b"]["ready"] == 1
 
 
-def test_combined_meter_labels_both_products_and_multiagent_state() -> None:
+def test_inexact_or_foreign_arm_traffic_makes_meter_not_ready(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    with (tmp_path / "runs/rrd-tokens.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "session": "rrd-demo-rrd-test-a-foreign",
+                    "measurement_state": "estimated",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                }
+            )
+            + "\n"
+        )
+
+    side = collect("rrd-test", root=tmp_path)["a"]
+    assert side["inexact_records"] == 1
+    assert side["ready"] == 0
+
+
+def test_missing_auxiliary_tollgate_partition_is_not_ready(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    token_path = tmp_path / "runs/rrd-tokens.jsonl"
+    rows = [json.loads(line) for line in token_path.read_text().splitlines()]
+    rows = [row for row in rows if row["session"] != "rrd-demo-rrd-test-a-summarizer"]
+    _jsonl(token_path, rows)
+
+    side = collect("rrd-test", root=tmp_path)["a"]
+    assert side["summarizer_records"] == 0
+    assert side["ready"] == 0
+
+
+def test_each_core_evidence_loss_falsifies_readiness(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    hook_path = tmp_path / "runs/rrd-demo/rrd-test/a/hook-events.jsonl"
+    rows = [json.loads(line) for line in hook_path.read_text().splitlines()]
+    rows = [row for row in rows if row["event"] != "root_merge"]
+    _jsonl(hook_path, rows)
+
+    side = collect("rrd-test", root=tmp_path)["a"]
+    assert side["root_merges"] == 0
+    assert side["ready"] == 0
+
+
+def test_spawn_and_packet_ids_must_correlate_to_assignments(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    hook_path = tmp_path / "runs/rrd-demo/rrd-test/a/hook-events.jsonl"
+    hooks = [json.loads(line) for line in hook_path.read_text().splitlines()]
+    next(row for row in hooks if row["event"] == "spawned")["tool_use_id"] = "unrelated-call"
+    _jsonl(hook_path, hooks)
+
+    assert collect("rrd-test", root=tmp_path)["a"]["ready"] == 0
+
+
+def test_wait_timeout_or_missing_delivered_result_falsifies_readiness(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    hook_path = tmp_path / "runs/rrd-demo/rrd-test/a/hook-events.jsonl"
+    hooks = [json.loads(line) for line in hook_path.read_text().splitlines()]
+    next(row for row in hooks if row["event"] == "wait_result")["timed_out"] = True
+    _jsonl(hook_path, hooks)
+    assert collect("rrd-test", root=tmp_path)["a"]["ready"] == 0
+
+    next(row for row in hooks if row["event"] == "wait_result")["timed_out"] = False
+    next(row for row in hooks if row["event"] == "result_final")["delivered_chars"] = 0
+    _jsonl(hook_path, hooks)
+    assert collect("rrd-test", root=tmp_path)["a"]["ready"] == 0
+
+
+def test_current_source_mutation_invalidates_previously_valid_receipts(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    shared = tmp_path / "runs/rrd-demo/rrd-test/a/target/src/models.js"
+    shared.write_text(shared.read_text() + "// changed after hook evidence\n")
+
+    side = collect("rrd-test", root=tmp_path)["a"]
+    assert side["source_state_ok"] == 0
+    assert side["ready"] == 0
+
+
+def test_current_source_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import _current_file_hash
+
+    target = tmp_path / "target"
+    (target / "src/handlers").mkdir(parents=True)
+    os.mkfifo(target / "src/handlers/users.js")
+    started = time.monotonic()
+    assert _current_file_hash(target, "src/handlers/users.js") is None
+    assert time.monotonic() - started < 0.25
+
+
+def test_serial_worker_lifetimes_and_missing_compression_are_not_ready(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect
+
+    _valid_round(tmp_path)
+    hook_path = tmp_path / "runs/rrd-demo/rrd-test/b/hook-events.jsonl"
+    rows = [json.loads(line) for line in hook_path.read_text().splitlines()]
+    _jsonl(hook_path.parent / "proxy-events.jsonl", [])
+    for index, row in enumerate(row for row in rows if row["event"] == "result_final"):
+        row["ts"] = 2.5 + index * 0.01
+    _jsonl(hook_path, rows)
+
+    side = collect("rrd-test", root=tmp_path)["b"]
+    assert side["overlap"] == 0
+    assert side["task_compressed"] == 0
+    assert side["ready"] == 0
+
+
+def test_meter_labels_single_pair_noncausal_and_never_mentions_opencode(tmp_path: Path) -> None:
+    from contextmesh.scripts.rrd_combined_meter import collect, render
+
+    _valid_round(tmp_path)
+    output = render("rrd-test", collect("rrd-test", root=tmp_path))
+
+    assert "Codex ContextMesh + ReasonRenderCoding" in output
+    assert "READY" in output and "PAIRED SAMPLE" in output
+    assert "not a causal estimate" in output
+    assert "Setup/seed tokens (excluded" in output
+    assert "counterfactual" in output
+    assert "across 4 workers" in output
+    assert "OpenCode" not in output
+
+
+def test_combined_meter_marks_empty_runs_not_ready() -> None:
     from contextmesh.scripts.rrd_combined_meter import render
 
-    side = {
-        "opencode_tokens": 900,
-        "planner_tokens": 100,
-        "combined_tokens": 1000,
-        "requests": 9,
-        "workers": 4,
-        "packets": 4,
-        "misses": 1,
-        "hits": 3,
-        "fail_open": 0,
-        "digest_hits": 12,
-        "digest_saved": 39088,
-        "task_compressed": 2,
-        "plugin_loaded": 1,
-        "digest_worker_sessions": 4,
-        "inexact_records": 0,
-        "ready": 1,
-    }
-    output = render("rrd-test", {"a": {**side, "misses": 4, "hits": 0}, "b": side})
-
-    assert "ContextMesh + ReasonRenderCoding" in output
-    assert "COLD + CM" in output and "WARM + CM" in output
-    assert "workers" in output and "4/4" in output
-    assert "RRC packets" in output and "1 MISS / 3 HIT" in output
-    assert "ContextMesh saved" in output
-    assert "READY" in output
-
-
-def test_combined_meter_marks_incomplete_runs_not_ready() -> None:
-    from contextmesh.scripts.rrd_combined_meter import render
-
-    empty = {
-        key: 0
-        for key in (
-            "opencode_tokens",
-            "planner_tokens",
-            "combined_tokens",
-            "requests",
-            "workers",
-            "packets",
-            "misses",
-            "hits",
-            "fail_open",
-            "digest_hits",
-            "digest_saved",
-            "task_compressed",
-            "inexact_records",
-            "ready",
-        )
-    }
-    output = render("rrd-empty", {"a": empty, "b": empty})
+    output = render("rrd-empty", {"a": {}, "b": {}})
     assert "NOT READY" in output
     assert "INCOMPLETE" in output
