@@ -5,18 +5,33 @@ Tails Tollgate's JSONL and shows running totals for the two demo sessions
 (demo-a vs demo-b, including b's summarizer overhead) plus ContextMesh digest
 activity from side B's metrics log. Refreshes in place every 2 seconds.
 
-Usage: python3 live_meter.py [--once]
+Usage: python3 live_meter.py [--once] [--runid RUNID]
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
-CM = Path(__file__).resolve().parent.parent
-TOKENS = CM / "runs" / "tokens.jsonl"
+CM = Path(os.environ.get("CONTEXTMESH_ROOT", Path(__file__).resolve().parent.parent))
+
+
+def _token_log_path() -> Path:
+    configured = os.environ.get("CONTEXTMESH_TOKENS_PATH")
+    if configured:
+        return Path(configured)
+    pointer = CM / "runs" / "token-log-path"
+    if pointer.exists():
+        value = pointer.read_text(encoding="utf-8").strip()
+        if value:
+            return Path(value)
+    return CM / "runs" / "tokens.jsonl"
+
+
+TOKENS = _token_log_path()
 ROUNDFILE = CM / "runs" / "demo-tui" / "round"
 
 
@@ -28,7 +43,7 @@ ROUND = current_round()
 METRICS_B = CM / "runs" / "demo-tui" / "b" / f"metrics-{ROUND}.jsonl"
 
 
-def totals() -> dict[str, dict[str, int]]:
+def totals(runid: str | None = None) -> dict[str, dict[str, int]]:
     out = {
         "a": {"input": 0, "output": 0, "requests": 0},
         "b": {"input": 0, "output": 0, "requests": 0},
@@ -36,12 +51,19 @@ def totals() -> dict[str, dict[str, int]]:
     }
     if not TOKENS.exists():
         return out
-    # Only this round's sessions: demo-<round>-a, demo-<round>-b, demo-<round>-b-summarizer
-    keymap = {
-        f"demo-{ROUND}-a": "a",
-        f"demo-{ROUND}-b": "b",
-        f"demo-{ROUND}-b-summarizer": "b-summarizer",
-    }
+    keymap = (
+        {
+            f"{runid}-a-cold": "a",
+            f"{runid}-b-warm": "b",
+            f"{runid}-b-warm-summarizer": "b-summarizer",
+        }
+        if runid
+        else {
+            f"demo-{ROUND}-a": "a",
+            f"demo-{ROUND}-b": "b",
+            f"demo-{ROUND}-b-summarizer": "b-summarizer",
+        }
+    )
     for line in TOKENS.read_text().splitlines():
         try:
             r = json.loads(line)
@@ -56,10 +78,11 @@ def totals() -> dict[str, dict[str, int]]:
     return out
 
 
-def digest_stats() -> dict[str, int]:
+def digest_stats(runid: str | None = None) -> dict[str, int]:
     stats = {"digest_hit": 0, "digest_stored": 0, "escape_hatch": 0, "reread_blocked": 0, "task_compressed": 0, "saved_tokens": 0}
-    if METRICS_B.exists():
-        for line in METRICS_B.read_text().splitlines():
+    metrics_path = CM / "runs" / runid / "b-warm" / "metrics.jsonl" if runid else METRICS_B
+    if metrics_path.exists():
+        for line in metrics_path.read_text().splitlines():
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
@@ -85,9 +108,13 @@ def subtract(cur: dict, base: dict) -> dict:
     return cur - base
 
 
-def render(t0: dict | None = None, d0: dict | None = None) -> str:
-    t = totals()
-    d = digest_stats()
+def render(
+    runid: str | None = None,
+    t0: dict | None = None,
+    d0: dict | None = None,
+) -> str:
+    t = totals(runid)
+    d = digest_stats(runid)
     if t0:
         t = subtract(t, t0)
     if d0:
@@ -98,9 +125,9 @@ def render(t0: dict | None = None, d0: dict | None = None) -> str:
     delta = a_total - b_total
     pct = f"{100 * delta / a_total:.1f}%" if a_total else "—"
     summ = t["b-summarizer"]["input"] + t["b-summarizer"]["output"]
-    title = f" ContextMesh live token meter — round {ROUND} "
+    title = f" ContextMesh live token meter — {runid or f'round {ROUND}'} "
     rows = [
-        ("", "STOCK (demo-a)", "CONTEXTMESH (demo-b)"),
+        ("", "STOCK (A COLD)", "CONTEXTMESH (B WARM)" if runid else "CONTEXTMESH (demo-b)"),
         ("requests", f"{t['a']['requests']:,}", f"{b_all['requests']:,}"),
         ("input tokens", f"{t['a']['input']:,}", f"{b_all['input']:,}"),
         ("output tokens", f"{t['a']['output']:,}", f"{b_all['output']:,}"),
@@ -133,14 +160,20 @@ def main() -> None:
     # Default: show deltas since the meter was launched, so each rehearsal
     # starts from zero. --absolute shows all-time totals for the sessions.
     absolute = "--absolute" in sys.argv
+    runid = None
+    if "--runid" in sys.argv:
+        try:
+            runid = sys.argv[sys.argv.index("--runid") + 1]
+        except IndexError:
+            raise SystemExit("--runid requires a value")
     if "--once" in sys.argv:
-        print(render())  # one absolute snapshot
+        print(render(runid=runid))  # one absolute snapshot
         return
-    t0 = None if absolute else totals()
-    d0 = None if absolute else digest_stats()
+    t0 = None if absolute else totals(runid)
+    d0 = None if absolute else digest_stats(runid)
     try:
         while True:
-            print("\033[2J\033[H" + render(t0, d0), flush=True)
+            print("\033[2J\033[H" + render(runid=runid, t0=t0, d0=d0), flush=True)
             time.sleep(2)
     except KeyboardInterrupt:
         pass

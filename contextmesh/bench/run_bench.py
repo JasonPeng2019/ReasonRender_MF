@@ -34,9 +34,10 @@ HERE = Path(__file__).resolve().parent
 CM = HERE.parent
 REPO = CM.parent
 OPENCODE_ENTRY = REPO / "opencode" / "packages" / "opencode" / "src" / "index.ts"
+OPENCODE_BIN = os.environ.get("CONTEXTMESH_OPENCODE_BIN")
 PROXY = "http://127.0.0.1:8788"
 EVEROS = "http://127.0.0.1:8000"
-MODEL = "ollama/deepseek-v4-flash:cloud"
+MODEL = "ollama/deepseek-v4-pro"
 
 TASK = (
     "Audit the HTTP handlers in this repository for input-validation, authorization, and "
@@ -50,12 +51,29 @@ TASK = (
 
 def load_env_local() -> dict[str, str]:
     env: dict[str, str] = {}
-    for line in (CM / ".env.local").read_text().splitlines():
+    path = CM / ".env.local"
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             env[k] = v
     return env
+
+
+def token_log_path() -> Path:
+    """Use the WSL-private Tollgate sink when the launcher wrote its pointer."""
+
+    configured = os.environ.get("CONTEXTMESH_TOKENS_PATH")
+    if configured:
+        return Path(configured)
+    pointer = CM / "runs" / "token-log-path"
+    if pointer.exists():
+        value = pointer.read_text(encoding="utf-8").strip()
+        if value:
+            return Path(value)
+    return CM / "runs" / "tokens.jsonl"
 
 
 def check_stack() -> None:
@@ -67,14 +85,22 @@ def check_stack() -> None:
             sys.exit(f"{name} is not reachable at {url} ({e}). Start it: contextmesh/scripts/start_stack.sh")
 
 
-def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int) -> Path:
+def run_arm(
+    runid: str,
+    arm: str,
+    mode: str,
+    model: str,
+    task: str,
+    timeout: int,
+    workspace_template: Path,
+) -> Path:
     label = f"{arm}-{mode}"
     rundir = CM / "runs" / runid / label
     if rundir.exists():
         shutil.rmtree(rundir)
     rundir.mkdir(parents=True)
     workspace = rundir / "target"
-    shutil.copytree(HERE / "target-template", workspace)
+    shutil.copytree(workspace_template, workspace)
     # Make the workspace its own git project so opencode does not walk up to the
     # enclosing ReasonRender_MF repo and treat it as the worktree.
     for gitcmd in (["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=bench@contextmesh", "-c", "user.name=bench", "commit", "-qm", "bench workspace"]):
@@ -108,7 +134,7 @@ def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int
                 # cold + warm share the runid namespace: cold populates, warm hits
                 "CONTEXTMESH_APP_ID": f"cm-{runid}",
                 "CONTEXTMESH_SUMMARIZER_URL": f"{PROXY}/ollama/{session}-summarizer/v1/chat/completions",
-                "CONTEXTMESH_SUMMARIZER_MODEL": env.get("CONTEXTMESH_MODEL", "deepseek-v4-flash:cloud"),
+                "CONTEXTMESH_SUMMARIZER_MODEL": env.get("CONTEXTMESH_MODEL", "deepseek-v4-flash:preview"),
                 "CONTEXTMESH_SYNC_SUMMARIZE": "1",
                 # 0.45 still guards against useless digests while capturing dense
                 # utility modules (a 0.45 digest saves 55% on every repeat read).
@@ -116,11 +142,7 @@ def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int
             }
         )
 
-    cmd = [
-        "bun",
-        "run",
-        "--conditions=browser",
-        str(OPENCODE_ENTRY),
+    cmd = ([OPENCODE_BIN] if OPENCODE_BIN else ["bun", "run", "--conditions=browser", str(OPENCODE_ENTRY)]) + [
         "run",
         "--format",
         "json",
@@ -198,7 +220,7 @@ def collect(rundir: Path, session: str, label: str, exit_code: int, wall: float)
 
     # --- Tollgate slice (independent meter) ---
     proxy_rows = []
-    tokens_path = CM / "runs" / "tokens.jsonl"
+    tokens_path = token_log_path()
     if tokens_path.exists():
         for line in tokens_path.read_text().splitlines():
             try:
@@ -261,17 +283,27 @@ def main() -> None:
     ap.add_argument("--no-warm", dest="warm", action="store_false")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument(
+        "--workspace-template",
+        type=Path,
+        default=HERE / "target-template",
+        help="workspace copied into each arm (default: target-template)",
+    )
+    ap.add_argument("--task-file", type=Path, help="read the OpenCode task prompt from this file")
     args = ap.parse_args()
 
-    if not OPENCODE_ENTRY.exists():
+    if OPENCODE_BIN and not Path(OPENCODE_BIN).is_file():
+        sys.exit(f"configured opencode binary not found: {OPENCODE_BIN}")
+    if not OPENCODE_BIN and not OPENCODE_ENTRY.exists():
         sys.exit(f"opencode entry not found: {OPENCODE_ENTRY}")
     check_stack()
 
+    task = args.task_file.read_text(encoding="utf-8") if args.task_file else TASK
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     for arm in arms:
-        run_arm(args.runid, arm, "cold", args.model, TASK, args.timeout)
+        run_arm(args.runid, arm, "cold", args.model, task, args.timeout, args.workspace_template)
     if args.warm and "b" in arms:
-        run_arm(args.runid, "b", "warm", args.model, TASK, args.timeout)
+        run_arm(args.runid, "b", "warm", args.model, task, args.timeout, args.workspace_template)
     print(f"done. Analyze with: python3 {HERE / 'analyze.py'} --runid {args.runid}")
 
 
