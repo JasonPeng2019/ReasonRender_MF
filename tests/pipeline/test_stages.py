@@ -20,6 +20,13 @@ def test_spec_stage_is_strict_single_shot_metered_and_hides_oracle() -> None:
         phrase in model.calls[0][1]
         for phrase in ("Do not run commands", "edit files", "or explain")
     )
+    assert "MUST be exactly one of the concrete values in RRC_SLOT_VALUES" in model.calls[0][1]
+    assert (
+        "Do not add parameter names, annotations, generic labels, or test literals"
+        in model.calls[0][1]
+    )
+    assert "slots.identifiers contains only function/identifier slot values" in model.calls[0][1]
+    assert "Tests must be self-contained" in model.calls[0][1]
     assert event.stage == "spec"
     assert event.provider == "fake"
     assert (event.arm, event.task_id, event.model, event.usage.total_tokens) == (

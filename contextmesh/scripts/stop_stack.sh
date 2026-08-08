@@ -13,4 +13,8 @@ for name in tollgate everos; do
 done
 pkill -f "token_tracker_proxy.py serve" 2>/dev/null && echo "tollgate: server process stopped"
 pkill -f "everos server start" 2>/dev/null && echo "everos: server process stopped"
+if command -v docker >/dev/null 2>&1; then
+  docker rm -f contextmesh-everos >/dev/null 2>&1 && echo "everos: container stopped"
+fi
+rm -f "$ROOT/runs/everos.container"
 exit 0

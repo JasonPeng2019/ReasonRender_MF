@@ -1,0 +1,72 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama/deepseek-v4-flash:cloud",
+  "default_agent": "orchestrator",
+  "share": "disabled",
+  "subagent_depth": 1,
+  "lsp": {
+    "typescript": {
+      "disabled": true
+    },
+    "eslint": {
+      "disabled": true
+    },
+    "oxlint": {
+      "disabled": true
+    },
+    "biome": {
+      "disabled": true
+    },
+    "deno": {
+      "disabled": true
+    }
+  },
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama Cloud",
+      "options": {
+        "baseURL": "{env:CONTEXTMESH_PROXY_BASE}",
+        "apiKey": "{env:OLLAMA_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash:cloud": {
+          "name": "DeepSeek V4 Flash (cloud)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "orchestrator": {
+      "mode": "primary",
+      "temperature": 0,
+      "description": "Coordinates the combined ContextMesh + ReasonRenderCoding audit through four parallel workers.",
+      "permission": {
+        "edit": "deny"
+      },
+      "prompt": "You are the ORCHESTRATOR for the combined ContextMesh + ReasonRenderCoding demo. You delegate the complete audit and never read or edit source files yourself.\n\nFor the audit request:\n1. List the four files in src/handlers using glob/list only; do NOT read their contents.\n2. In your next single assistant turn, emit exactly ONE foreground task call per handler (four task calls total), all with subagent_type=\"worker\". Emit all four calls together before receiving any result: do not use background mode, do not wait between calls, and do not split them into waves. Each task prompt must name exactly one assigned src/handlers/*.js path and instruct the worker to fully read that handler plus src/models.js, src/utils.js, and src/middleware.js before reporting.\n3. After all four workers return, merge their findings into one final audit report grouped by handler file. Each issue must include severity (high/medium/low) and file:line.\n\nThe ReasonRenderCoding plugin automatically appends a validated read-only Plan + Spec packet to every worker task; do not call an RRC tool yourself. ContextMesh automatically optimizes repeated worker reads and large task results.\n\nRules: do not read source file contents yourself; do not modify files; spawn all four workers; final output is only the merged audit report. Use the task tool directly, never code-mode wrappers.",
+      "steps": 16
+    },
+    "worker": {
+      "mode": "subagent",
+      "temperature": 0,
+      "description": "Audits exactly one assigned HTTP handler using its ReasonRenderCoding packet and the shared core files.",
+      "permission": {
+        "edit": "deny"
+      },
+      "prompt": "You are a WORKER auditing exactly one assigned handler. Your task message contains the original assignment followed by a [ReasonRenderCoding] read-only Plan + Spec packet. Follow both; the original assignment is authoritative if they ever conflict.\n\n1. Read your assigned handler ONCE with offset=1 and limit=500 for exact line numbers.\n2. Read src/models.js, src/utils.js, and src/middleware.js ONCE each with plain full reads. A ContextMesh structural digest is authoritative and complete for cross-referencing.\n3. Audit every route and consumed request field for missing/incorrect input validation, authorization/ownership/role/state-transition bugs, type mismatches, security problems, rate-limit gaps, and unhandled or over-broad errors. Trace shared validators/helpers rather than assuming a call validates every field.\n4. Pay special attention to credential type/strength, brute-force protection, request-body booleans coerced with === true without required/type checks, and every cancel/refund/moderation mutation.\n\nOutput one concise line per issue: severity, file:line, and one-sentence explanation. No preamble. Do not edit files, spawn subagents, or reread a file."
+    }
+  },
+  "plugin": [
+    "{env:CONTEXTMESH_PLUGIN_PATH}",
+    "{env:RRC_PLUGIN_PATH}"
+  ]
+}

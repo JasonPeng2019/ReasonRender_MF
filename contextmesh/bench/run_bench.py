@@ -38,14 +38,7 @@ PROXY = "http://127.0.0.1:8788"
 EVEROS = "http://127.0.0.1:8000"
 MODEL = "ollama/deepseek-v4-flash:cloud"
 
-TASK = (
-    "Audit the HTTP handlers in this repository for input-validation, authorization, and "
-    "error-handling bugs. The handler files are in src/handlers/ (there are 4). Spawn ONE "
-    'worker subagent per handler file using the task tool with subagent_type="worker" — launch '
-    "them in parallel — and have each worker fully read its handler plus the shared files "
-    "src/models.js, src/utils.js, src/middleware.js before reporting. Then merge all worker "
-    "reports into one final audit report grouped by file, each issue with a severity and file:line."
-)
+TASK = (CM / "demo-prompt.txt").read_text().strip()
 
 
 def load_env_local() -> dict[str, str]:
@@ -64,7 +57,9 @@ def check_stack() -> None:
             with urllib.request.urlopen(url, timeout=5):
                 pass
         except Exception as e:
-            sys.exit(f"{name} is not reachable at {url} ({e}). Start it: contextmesh/scripts/start_stack.sh")
+            sys.exit(
+                f"{name} is not reachable at {url} ({e}). Start it: contextmesh/scripts/start_stack.sh"
+            )
 
 
 def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int) -> Path:
@@ -77,7 +72,20 @@ def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int
     shutil.copytree(HERE / "target-template", workspace)
     # Make the workspace its own git project so opencode does not walk up to the
     # enclosing ReasonRender_MF repo and treat it as the worktree.
-    for gitcmd in (["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=bench@contextmesh", "-c", "user.name=bench", "commit", "-qm", "bench workspace"]):
+    for gitcmd in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+        [
+            "git",
+            "-c",
+            "user.email=bench@contextmesh",
+            "-c",
+            "user.name=bench",
+            "commit",
+            "-qm",
+            "bench workspace",
+        ],
+    ):
         subprocess.run(gitcmd, cwd=workspace, check=True, capture_output=True)
     (rundir / "config-dir").mkdir()  # empty OPENCODE_CONFIG_DIR → no global/plugin leakage
 
@@ -108,7 +116,9 @@ def run_arm(runid: str, arm: str, mode: str, model: str, task: str, timeout: int
                 # cold + warm share the runid namespace: cold populates, warm hits
                 "CONTEXTMESH_APP_ID": f"cm-{runid}",
                 "CONTEXTMESH_SUMMARIZER_URL": f"{PROXY}/ollama/{session}-summarizer/v1/chat/completions",
-                "CONTEXTMESH_SUMMARIZER_MODEL": env.get("CONTEXTMESH_MODEL", "deepseek-v4-flash:cloud"),
+                "CONTEXTMESH_SUMMARIZER_MODEL": env.get(
+                    "CONTEXTMESH_MODEL", "deepseek-v4-flash:cloud"
+                ),
                 "CONTEXTMESH_SYNC_SUMMARIZE": "1",
                 # 0.45 still guards against useless digests while capturing dense
                 # utility modules (a 0.45 digest saves 55% on every repeat read).
@@ -212,12 +222,18 @@ def collect(rundir: Path, session: str, label: str, exit_code: int, wall: float)
         "exact": sum(1 for r in proxy_rows if r.get("measurement_state") == "exact"),
         "input_tokens": sum(r.get("input_tokens") or 0 for r in proxy_rows),
         "output_tokens": sum(r.get("output_tokens") or 0 for r in proxy_rows),
-        "summarizer_requests": sum(1 for r in proxy_rows if r.get("session") == f"{session}-summarizer"),
+        "summarizer_requests": sum(
+            1 for r in proxy_rows if r.get("session") == f"{session}-summarizer"
+        ),
         "summarizer_input_tokens": sum(
-            r.get("input_tokens") or 0 for r in proxy_rows if r.get("session") == f"{session}-summarizer"
+            r.get("input_tokens") or 0
+            for r in proxy_rows
+            if r.get("session") == f"{session}-summarizer"
         ),
         "summarizer_output_tokens": sum(
-            r.get("output_tokens") or 0 for r in proxy_rows if r.get("session") == f"{session}-summarizer"
+            r.get("output_tokens") or 0
+            for r in proxy_rows
+            if r.get("session") == f"{session}-summarizer"
         ),
     }
 
@@ -257,7 +273,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runid", required=True)
     ap.add_argument("--arms", default="a,b", help="comma list from {a,b}")
-    ap.add_argument("--warm", action="store_true", default=True, help="also run arm B warm (default)")
+    ap.add_argument(
+        "--warm", action="store_true", default=True, help="also run arm B warm (default)"
+    )
     ap.add_argument("--no-warm", dest="warm", action="store_false")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--timeout", type=int, default=1800)

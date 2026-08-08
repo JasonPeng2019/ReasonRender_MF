@@ -17,21 +17,15 @@
 # (We use the installed binary, not `bun run src/index.ts`, because the
 # from-source TUI renderer does not draw — that was the blank-screen bug.)
 #
-# Suggested demo prompt (same in both):
-#   Audit the HTTP handlers in this repository for input-validation,
-#   authorization, and error-handling bugs. The handler files are in
-#   src/handlers/ (there are 4). Spawn ONE worker subagent per handler file
-#   using the task tool with subagent_type="worker" — launch them in parallel —
-#   and have each worker fully read its handler plus the shared files
-#   src/models.js, src/utils.js, src/middleware.js before reporting. Then merge
-#   all worker reports into one final audit report grouped by file.
+# The canonical website/demo prompt is contextmesh/demo-prompt.txt. Both TUI
+# arms and the headless benchmark read that same file so their workloads cannot
+# drift apart.
 set -euo pipefail
 
 SIDE="${1:-}"
 [[ "$SIDE" =~ ^(a|b|seed|reset)$ ]] || { echo "usage: demo_tui.sh <reset|seed|a|b>"; exit 1; }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO="$(cd "$ROOT/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/.env.local"
 
@@ -48,6 +42,21 @@ fi
 
 [ -f "$ROUNDFILE" ] || echo "r$(date +%s)" > "$ROUNDFILE"
 ROUND="$(cat "$ROUNDFILE")"
+
+# Do not enter OpenCode's long retry loop when the local services were not
+# started (or died after prep). Keep this check here as well as in demo.sh so a
+# direct demo_tui.sh invocation still fails with an actionable command.
+require_health() {
+  local name="$1" url="$2"
+  if ! curl -sf -m 2 "$url" >/dev/null 2>&1; then
+    echo "$name is not reachable on ${url%/health*}. Run: $ROOT/demo.sh prep" >&2
+    exit 1
+  fi
+}
+require_health "Tollgate" "http://127.0.0.1:8788/healthz"
+if [ "$SIDE" = "b" ] || [ "$SIDE" = "seed" ]; then
+  require_health "EverOS" "http://127.0.0.1:8000/health"
+fi
 
 # One shared demo workspace per side keeps DBs/sessions separate but content identical.
 ARM="$SIDE"; [ "$SIDE" = "seed" ] && ARM="b"
@@ -89,8 +98,7 @@ fi
 cd "$DEMO/target"
 export PWD="$DEMO/target"
 
-TASK='Audit the HTTP handlers in this repository for input-validation, authorization, and error-handling bugs. The handler files are in src/handlers/ (there are 4). Spawn ONE worker subagent per handler file using the task tool with subagent_type="worker" — launch them in parallel — and have each worker fully read its handler plus the shared files src/models.js, src/utils.js, src/middleware.js before reporting. Then merge all worker reports into one final audit report grouped by file.'
-
+TASK="$(cat "$ROOT/demo-prompt.txt")"
 printf '%s\n' "$TASK" > "$ROOT/runs/demo-prompt.txt"
 
 # The real opencode CLI. Must be v1.18.15+ (matches the pinned submodule).

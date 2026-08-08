@@ -29,6 +29,7 @@ snowflake/load.py → AGENT_TOKEN_EVENTS  events → metrics.jsonl
 
 ```
 contextmesh/
+  demo-prompt.txt           canonical website/TUI/benchmark audit prompt
   plugin/contextmesh.ts     the Arm B plugin (M1 + M3 + expand_result + metrics)
   configs/arm-a.json        stock arm (provider + orchestrator/worker agents)
   configs/arm-b.json        identical + plugin entry
@@ -117,10 +118,11 @@ cache; EverOS is the durable cross-run layer — which is what makes **warm runs
   collapsing it back to the cheap digest — this only touches files already
   digested this session, so a worker's raw read of its own audit target is
   untouched and audit quality is preserved; (4) equal `steps` caps (worker 8,
-  orchestrator 12) in **both** arms as a runaway backstop. With this on, observed
-  rounds run at equal turn counts (e.g. A=12 / B=12) with B ~34% below A and the
-  step caps never actually hit (no truncation). `arm-a.json` and `arm-b.json` are
-  byte-identical except the `plugin` field.
+  orchestrator 16) in **both** arms as a runaway backstop; (5) workers launch in
+  two waves of at most two to avoid provider-side concurrency stalls. Both arms
+  therefore follow the same bounded schedule, while B replaces repeated
+  shared-file reads with digests. The parsed `arm-a.json` and `arm-b.json`
+  configs are identical except for B's `plugin` field.
 - **Workload sizing:** savings scale with *(workers − 1) × shared-file size*.
   `bench/target-template` has 4 handlers sharing three core modules (~43K chars).
   Bigger/more shared modules → bigger, steadier win.
@@ -143,8 +145,10 @@ cd contextmesh
 ```
 
 `demo.sh prep` wraps `start_stack.sh` + `demo_tui.sh reset` + `demo_tui.sh seed`
-+ clipboard + `demo_preflight.sh`. The individual scripts still work standalone
-if you prefer.
++ clipboard + `demo_preflight.sh`. The prompt is read from the committed
+`demo-prompt.txt`; the TUI and headless benchmark use that same file so the
+website workload cannot drift between demo paths. The individual scripts still
+work standalone if you prefer.
 
 In each TUI the agent + model are preselected; just paste (⌘V) the prompt and
 press Enter on both. The live meter reads the current round only (from
@@ -154,6 +158,50 @@ press Enter on both. The live meter reads the current round only (from
 > Why not run from source? `bun run src/index.ts` starts the TUI but its
 > renderer draws nothing (blank screen) — the reliable path is the compiled
 > `opencode` binary, which is the same v1.18.15 and loads the plugin identically.
+
+## Combined ContextMesh + ReasonRenderCoding multi-agent demo
+
+`RRDdemo.sh` mirrors the three-terminal `demo.sh` experience but tests the two
+systems together. Both arms select the real OpenCode `orchestrator`, expose the
+`worker` subagent, and load both plugins. The canonical four-handler audit
+causes four foreground `task` calls in one assistant turn:
+
+1. `plugin/reasonrendercoding.ts` intercepts each task before execution and
+   resolves a validated read-only Plan + Spec through
+   `rrc.orchestrator_runtime.OrchestratorRuntime`.
+2. The actual OpenCode worker receives its original audit assignment plus the
+   rendered RRC packet.
+3. `plugin/contextmesh.ts` serves shared-file digests inside the worker and can
+   compress the completed worker result before the orchestrator merges it.
+
+Side A is RRC **COLD**: all four worker packets require planner calls. Side B is
+RRC **WARM**: a short round-local lock makes the first packet a MISS, waits
+until its exact EverOS `external_ref` is visible, then the three sibling tasks
+reuse it from EverOS + SQLite with zero planner tokens. The lock covers packet
+resolution only; it is released before each real worker starts.
+
+```bash
+cd contextmesh
+./RRDdemo.sh prep       # stack + new round + seed ContextMesh digests + audit prompt
+# terminal 1:  ./RRDdemo.sh a       # ContextMesh + COLD RRC + four workers
+# terminal 2:  ./RRDdemo.sh b       # ContextMesh + WARM RRC + four workers
+# terminal 3:  ./RRDdemo.sh meter   # combined token/reuse/context display
+```
+
+Paste the prompt copied by `prep` into both TUIs. `RRD-demo-prompt.txt` is kept
+byte-identical to `demo-prompt.txt`, so the ordinary and combined website demos
+cannot drift. Set `RRC_MODEL` to override the Codex planner model read from
+`~/.codex/config.toml`. The launcher performs the same Tollgate/EverOS health
+checks as `demo.sh`; a dead service fails before OpenCode's opaque API retry
+loop.
+
+Per-arm evidence lives in `runs/rrd-demo/<round>/{a,b}/`: `opencode.db` for the
+real parent/worker sessions, `contextmesh.jsonl` for digest/result events,
+`rrc-events.jsonl` for MISS/HIT/fail-open events, `rrc-model-events.jsonl` for
+raw Codex planner evidence, and `plan-spec.sqlite` for exact WARM packets. The
+meter treats Tollgate as the sole OpenCode token authority, adds disjoint Codex
+planner usage, and displays ContextMesh savings separately as counterfactual
+tokens rather than double-counting them.
 
 ## Demo-day flow
 

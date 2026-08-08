@@ -20,10 +20,16 @@ case "$cmd" in
     "$ROOT/scripts/start_stack.sh"
     "$ROOT/scripts/demo_tui.sh" reset
     "$ROOT/scripts/demo_tui.sh" seed
-    command -v pbcopy >/dev/null && pbcopy < "$ROOT/runs/demo-prompt.txt" && echo "prompt copied to clipboard"
+    command -v pbcopy >/dev/null && pbcopy < "$ROOT/demo-prompt.txt" && echo "prompt copied to clipboard"
     "$ROOT/scripts/demo_preflight.sh" || true
     ;;
-  a|b)     exec "$ROOT/scripts/demo_tui.sh" "$cmd" ;;
+  a|b)
+    # A and B both depend on the local Tollgate proxy (and B on EverOS). Start
+    # the idempotent stack here so launching a side directly cannot strand
+    # OpenCode in its opaque "Cannot connect to API" retry loop.
+    "$ROOT/scripts/start_stack.sh"
+    exec "$ROOT/scripts/demo_tui.sh" "$cmd"
+    ;;
   seed)    exec "$ROOT/scripts/demo_tui.sh" seed ;;
   reset)   exec "$ROOT/scripts/demo_tui.sh" reset ;;
   meter)   exec python3 "$ROOT/scripts/live_meter.py" ;;

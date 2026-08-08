@@ -3,9 +3,145 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from rrc.contract import Completion, ModelPort, ModelRole, RunContext, Usage
+
+_SHAPE_PREFIX = "RRC_SHAPE:"
+_VALUES_PREFIX = "RRC_SLOT_VALUES:"
+
+
+def _marker_object(prompt: str, prefix: str) -> dict[str, Any] | None:
+    matches = [
+        line[len(prefix) :].strip() for line in prompt.splitlines() if line.startswith(prefix)
+    ]
+    if len(matches) != 1:
+        return None
+    try:
+        value = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _array_schema(allowed: list[str], *, exact_length: int | None = None) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "array"}
+    if not allowed:
+        schema["maxItems"] = 0
+        return schema
+    schema["items"] = {"type": "string", "enum": allowed}
+    length = len(allowed) if exact_length is None else exact_length
+    schema["minItems"] = length
+    schema["maxItems"] = length
+    return schema
+
+
+def _spec_output_schema(prompt: str) -> dict[str, Any] | None:
+    """Build a task-specific structured-output fence for the strict SPEC artifact."""
+
+    shape = _marker_object(prompt, _SHAPE_PREFIX)
+    values = _marker_object(prompt, _VALUES_PREFIX)
+    if (
+        shape is None
+        or values is None
+        or any(not isinstance(value, str) for value in values.values())
+    ):
+        return None
+    concrete = {str(key): str(value) for key, value in values.items()}
+    fields_value = shape.get("fields")
+    fields = (
+        list(fields_value)
+        if isinstance(fields_value, list) and all(isinstance(value, str) for value in fields_value)
+        else []
+    )
+
+    def selected(predicate: Callable[[str], bool]) -> list[str]:
+        return [value for key, value in concrete.items() if predicate(key.lower())]
+
+    identifiers = selected(
+        lambda key: (
+            key in {"function", "identifier"}
+            or key.endswith("_function")
+            or key.endswith("_identifier")
+        )
+    )
+    types = selected(lambda key: key == "type" or key.endswith("_type"))
+    constants = selected(
+        lambda key: (
+            key in {"constant", "number"} or key.endswith("_constant") or key.endswith("_number")
+        )
+    )
+    edge_values = selected(
+        lambda key: key == "edge" or key.startswith("edge_") or key.endswith("_edge")
+    )
+    entity = concrete.get("entity")
+    function = concrete.get("function")
+    number = concrete.get("number")
+    signature_schema: dict[str, Any] = {"type": "string"}
+    if function is not None:
+        signature_match = re.search(
+            rf"\bImplement\s+{re.escape(function)}\(([^()\n]*)\)\s*->\s*([^\s.,]+)",
+            prompt,
+        )
+        if signature_match is not None:
+            parameters, return_type = signature_match.groups()
+            signature_schema["enum"] = [
+                f"def {function}({parameters.strip()}) -> {return_type.strip()}"
+            ]
+    tests_schema: dict[str, Any] = {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 3,
+    }
+    if function is not None and number is not None:
+        tests_schema = {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [f"def test_behavior():\n    assert {function}(99) == {number}"],
+            },
+            "minItems": 1,
+            "maxItems": 1,
+        }
+    category_properties = {
+        "entity": {"type": "null"} if entity is None else {"type": "string", "enum": [entity]},
+        "identifiers": _array_schema(identifiers),
+        "types": _array_schema(types),
+        "fields": _array_schema(fields, exact_length=len(fields)),
+        "constants": _array_schema(constants),
+        "edge_values": _array_schema(edge_values),
+        "values": {
+            "type": "object",
+            "properties": {
+                key: {"type": "string", "enum": [value]} for key, value in concrete.items()
+            },
+            "required": list(concrete),
+            "additionalProperties": False,
+        },
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "plan": {"type": "string"},
+            "signature": signature_schema,
+            "contract": {"type": "string"},
+            "tests": tests_schema,
+            "slots": {
+                "type": "object",
+                "properties": category_properties,
+                "required": list(category_properties),
+                "additionalProperties": False,
+            },
+        },
+        "required": ["plan", "signature", "contract", "tests", "slots"],
+        "additionalProperties": False,
+    }
 
 
 def _token_count(value: object) -> int | None:
@@ -67,12 +203,45 @@ class CodexModel(ModelPort):
         strong_model: str = "gpt-5",
         small_model: str | None = None,
         executable: str = "codex",
+        artifact_log: str | Path | None = None,
     ) -> None:
         self._models = {
             ModelRole.STRONG: strong_model,
             ModelRole.SMALL: small_model or strong_model,
         }
         self._executable = executable
+        self._artifact_log = Path(artifact_log) if artifact_log is not None else None
+
+    def _record(
+        self,
+        *,
+        role: ModelRole,
+        model: str,
+        prompt: str,
+        ctx: RunContext,
+        stage: str,
+        text: str,
+        usage: Usage,
+    ) -> None:
+        if self._artifact_log is None:
+            return
+        self._artifact_log.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "arm": ctx.arm,
+            "task_id": ctx.task_id,
+            "stage": stage,
+            "role": role.value,
+            "model": model,
+            "prompt": prompt,
+            "response": text,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+        }
+        with self._artifact_log.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def complete(
         self,
@@ -83,21 +252,43 @@ class CodexModel(ModelPort):
     ) -> Completion:
         """Return exactly one typed completion with provider-reported usage."""
 
-        del ctx, stage
         model = self._models[role]
         command = [
             self._executable,
             "exec",
             "--json",
+            # Artifact calls must not inherit repository AGENTS instructions:
+            # those add thousands of irrelevant tokens and can conflict with
+            # the strict JSON/code-only stage contract.
+            "--ignore-rules",
+            # RRC persists its own typed evidence; do not create a full Codex
+            # session rollout for every single-stage completion.
+            "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
             "--model",
             model,
-            prompt,
         ]
+        schema = _spec_output_schema(prompt) if stage in {"spec", "fallback_spec"} else None
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if schema is None:
+                result = subprocess.run(
+                    [*command, prompt], capture_output=True, text=True, check=False
+                )
+            else:
+                with tempfile.TemporaryDirectory(prefix="rrc-schema-") as directory:
+                    schema_path = Path(directory) / "spec-output.schema.json"
+                    schema_path.write_text(
+                        json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    result = subprocess.run(
+                        [*command, "--output-schema", str(schema_path), prompt],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
         except OSError as exc:
             raise RuntimeError(f"could not start codex exec: {exc}") from exc
         if result.returncode != 0:
@@ -105,4 +296,13 @@ class CodexModel(ModelPort):
             raise RuntimeError(f"codex exec failed with exit code {result.returncode}{detail}")
 
         text, usage = parse_codex_jsonl(result.stdout)
+        self._record(
+            role=role,
+            model=model,
+            prompt=prompt,
+            ctx=ctx,
+            stage=stage,
+            text=text,
+            usage=usage,
+        )
         return Completion(text=text, usage=usage, model=model)
