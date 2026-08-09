@@ -214,34 +214,12 @@ def _run(
     *,
     boundary: str = "",
     failure: str = "",
-    response_proxy: bool = False,
-    worker_payload: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], Provider, list[dict[str, Any]]]:
     provider = Provider()
-    provider.worker_payload = worker_payload
     if boundary:
         provider.child_delay = 0.05
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
-    proxy = None
-    proxy_thread = None
-    if response_proxy:
-        from contextmesh.scripts.rrd_response_proxy import Server as ProxyServer
-
-        runs = tmp_path / "runs"
-        arm = runs / "rrd-demo/rrd-test/a"
-        (arm / "target").mkdir(parents=True)
-        (arm / "summarizer-home").mkdir()
-        bundle = runs / "rrd-demo/rrd-test/bundle/rrd_codex_hook.py"
-        bundle.parent.mkdir(parents=True)
-        bundle.write_text("print('COMPRESSED INSTALLED CODEX WORKER REPORT')\n")
-        proxy = ProxyServer(
-            ("127.0.0.1", 0),
-            upstream=f"http://127.0.0.1:{provider.server_port}",
-            runs=runs,
-        )
-        proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-        proxy_thread.start()
     home = tmp_path / "home"
     home.mkdir()
     hook_log = tmp_path / "hooks.jsonl"
@@ -278,10 +256,7 @@ elif event in {'SubagentStop','Stop'}: print('{}')
         hooks_by_event[name] = [entry]
     hooks = {"hooks": hooks_by_event}
     (home / "hooks.json").write_text(json.dumps(hooks))
-    if proxy is None:
-        base_url = f"http://127.0.0.1:{provider.server_port}/v1"
-    else:
-        base_url = f"http://127.0.0.1:{proxy.server_port}/ollama/rrd-demo-rrd-test-a-outer/v1"
+    fixture_url = f"http://127.0.0.1:{provider.server_port}/v1"
     (home / "config.toml").write_text(
         f"""model="gpt-5.4"
 model_provider="local"
@@ -290,7 +265,7 @@ sandbox_mode="read-only"
 web_search="disabled"
 [model_providers.local]
 name="local"
-base_url="{base_url}"
+base_url="{fixture_url}"
 env_key="TEST_KEY"
 wire_api="responses"
 request_max_retries=0
@@ -344,11 +319,6 @@ plugins=false
             check=False,
         )
     finally:
-        if proxy is not None:
-            proxy.shutdown()
-            proxy.server_close()
-            assert proxy_thread is not None
-            proxy_thread.join(timeout=2)
         provider.shutdown()
         provider.server_close()
         thread.join(timeout=2)
@@ -398,40 +368,6 @@ def test_installed_codex_v1_accepts_rewrite_start_context_and_four_native_worker
     assert "plugins=false" in (tmp_path / "home/config.toml").read_text()
     hook_log_mode = (tmp_path / "hooks.jsonl").stat().st_mode & 0o777
     assert hook_log_mode == 0o600
-
-
-def test_installed_codex_root_receives_proxy_summary_not_oversized_raw_result(
-    tmp_path: Path, monkeypatch
-) -> None:
-    raw_marker = "RAW-INSTALLED-CODEX-WORKER-RESULT-" + ("x" * 4000)
-    monkeypatch.setenv("RRD_TASK_COMPRESS_CHARS", "100")
-
-    result, provider, _events = _run(
-        tmp_path,
-        response_proxy=True,
-        worker_payload=raw_marker,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "ROOT_MERGED workers=4" in result.stdout
-    root_history = json.dumps(
-        [
-            request["body"].get("input", [])
-            for request in provider.requests
-            if not request["subagent"]
-        ]
-    )
-    assert raw_marker not in root_history
-    assert "COMPRESSED INSTALLED CODEX WORKER REPORT" in root_history
-    assert "receipt=" in root_history
-    proxy_rows = [
-        json.loads(line)
-        for line in (tmp_path / "runs/rrd-demo/rrd-test/a/proxy-events.jsonl")
-        .read_text()
-        .splitlines()
-    ]
-    assert len(proxy_rows) == 4
-    assert all(row["event"] == "result_compress" for row in proxy_rows)
 
 
 @pytest.mark.parametrize("boundary", ["PreToolUse", "SubagentStart", "SubagentStop"])

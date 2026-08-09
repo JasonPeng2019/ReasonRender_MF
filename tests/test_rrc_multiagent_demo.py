@@ -47,6 +47,16 @@ def _packet() -> PlanSpecPacket:
     )
 
 
+def test_rrc_event_fifo_is_best_effort_and_nonblocking(tmp_path: Path) -> None:
+    from rrc.multiagent_demo import _append_jsonl
+
+    events = tmp_path / "events.jsonl"
+    os.mkfifo(events)
+    started = time.monotonic()
+    _append_jsonl(events, {"event": "fail_open"})
+    assert time.monotonic() - started < 0.25
+
+
 class FakePlanner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -272,6 +282,70 @@ def test_exact_ref_visibility_waits_for_the_new_reference() -> None:
     assert index.calls == 3
 
 
+def test_sqlite_case_index_is_exact_round_scoped_and_process_persistent(tmp_path: Path) -> None:
+    from rrc.multiagent_demo import SQLiteCaseIndex
+
+    database = tmp_path / "packets.sqlite"
+    SQLiteCaseIndex(database, "round-a").index("same shape", "ref-a")
+
+    assert SQLiteCaseIndex(database, "round-a").search("same shape") == [("ref-a", 1.0)]
+    assert SQLiteCaseIndex(database, "round-a").search("same shape ") == []
+    assert SQLiteCaseIndex(database, "round-b").search("same shape") == []
+
+
+def test_round_everos_case_store_round_trips_without_flush() -> None:
+    from rrc.multiagent_demo import RoundEverOSCaseIndex
+
+    records: dict[str, str] = {}
+    paths: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            paths.append(self.path)
+            if self.path.endswith("/add"):
+                records[str(payload["session_id"])] = str(payload["messages"][0]["content"])
+                body = {"data": {"status": "accumulated"}}
+            else:
+                key = str(payload["filters"]["session_id"])
+                content = records.get(key)
+                body = {
+                    "data": {
+                        "unprocessed_messages": [] if content is None else [{"content": content}]
+                    }
+                }
+            encoded = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        index = RoundEverOSCaseIndex(f"http://127.0.0.1:{server.server_port}", "round-a")
+        index.index("same shape", "ref-a")
+        assert index.search("same shape") == [("ref-a", 1.0)]
+        assert index.search("other shape") == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert paths == [
+        "/api/v2/memory/add",
+        "/api/v2/memory/search",
+        "/api/v2/memory/search",
+    ]
+    assert not any(path.endswith("/flush") for path in paths)
+
+
 def test_planner_failure_persists_raw_process_evidence(tmp_path: Path) -> None:
     from rrc.multiagent_demo import CodexPacketPlanner, audit_task
 
@@ -316,7 +390,7 @@ def test_planner_passes_a_bounded_deadline_and_isolated_environment(tmp_path: Pa
         task=task,
         artifact_log=artifact,
         timeout=0.05,
-        env={"CODEX_HOME": "/isolated/planner", "OLLAMA_API_KEY": "not-logged"},
+        env={"CODEX_HOME": "/isolated/planner", "EXAMPLE_API_KEY": "not-logged"},
         run=timed_out_run,
     )
 
@@ -324,10 +398,7 @@ def test_planner_passes_a_bounded_deadline_and_isolated_environment(tmp_path: Pa
         planner("generic prompt", "fake")
 
     assert observed["timeout"] == 0.05
-    assert observed["env"] == {
-        "CODEX_HOME": "/isolated/planner",
-        "OLLAMA_API_KEY": "not-logged",
-    }
+    assert observed["env"] == {"CODEX_HOME": "/isolated/planner"}
     event = json.loads(artifact.read_text())
     assert event["parse_status"] == "timeout"
     assert event["timeout_seconds"] == 0.05
@@ -430,7 +501,7 @@ def test_planner_preserves_usage_when_response_json_is_invalid(tmp_path: Path) -
 
 
 def test_four_parallel_warm_resolutions_make_one_planner_call(tmp_path: Path) -> None:
-    state: dict[str, str | None] = {"ref": None}
+    state: dict[str, str | None] = {"content": None}
     state_lock = threading.Lock()
 
     class EverOSHandler(BaseHTTPRequestHandler):
@@ -439,12 +510,14 @@ def test_four_parallel_warm_resolutions_make_one_planner_call(tmp_path: Path) ->
             payload = json.loads(self.rfile.read(length) or b"{}")
             with state_lock:
                 if self.path.endswith("/add"):
-                    state["ref"] = payload.get("external_ref")
-                reference = state["ref"]
+                    state["content"] = payload["messages"][0]["content"]
+                content = state["content"]
             body: dict[str, object] = {}
             if self.path.endswith("/search"):
-                episodes = [] if reference is None else [{"external_ref": reference, "score": 1.0}]
-                body = {"data": {"episodes": episodes}}
+                messages = [] if content is None else [{"content": content}]
+                body = {"data": {"unprocessed_messages": messages}}
+            elif self.path.endswith("/add"):
+                body = {"data": {"status": "accumulated"}}
             encoded = json.dumps(body).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -482,6 +555,8 @@ def test_four_parallel_warm_resolutions_make_one_planner_call(tmp_path: Path) ->
             "resolve",
             "--mode",
             "warm",
+            "--memory-backend",
+            "everos",
             "--round-id",
             "parallel-test",
             "--database",
@@ -526,3 +601,84 @@ def test_four_parallel_warm_resolutions_make_one_planner_call(tmp_path: Path) ->
     assert sorted(payload["branch"] for payload in payloads) == ["hit", "hit", "hit", "miss"]
     assert calls.read_text().splitlines() == ["call"]
     assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 4
+
+
+def test_local_cli_miss_then_hit_ignores_a_poison_everos_listener(tmp_path: Path) -> None:
+    requests: list[str] = []
+
+    class PoisonHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            requests.append(self.path)
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PoisonHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        packet = json.dumps(_packet().to_dict())
+        codex = fake_bin / "codex"
+        codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            f"packet = {packet!r}\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':packet}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5,'total_tokens':15}}))\n"
+        )
+        codex.chmod(0o755)
+        common = [
+            sys.executable,
+            "-m",
+            "rrc.multiagent_demo",
+            "resolve",
+            "--mode",
+            "warm",
+            "--memory-backend",
+            "sqlite",
+            "--round-id",
+            "local-cli",
+            "--database",
+            str(tmp_path / "packets.sqlite"),
+            "--lock",
+            str(tmp_path / "packets.lock"),
+            "--events",
+            str(tmp_path / "events.jsonl"),
+            "--model-events",
+            str(tmp_path / "models.jsonl"),
+            "--model",
+            "fake",
+            "--everos-url",
+            f"http://127.0.0.1:{server.server_port}",
+        ]
+        env = {**os.environ, "RRD_CODEX_BIN": str(codex)}
+        outputs = []
+        for name in ("auth", "users"):
+            result = subprocess.run(
+                [
+                    *common,
+                    "--task-id",
+                    name,
+                    "--task-prompt",
+                    f"Audit src/handlers/{name}.js against the shared files.",
+                ],
+                cwd=Path(__file__).parents[1],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            )
+            outputs.append(json.loads(result.stdout))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert [payload["branch"] for payload in outputs] == ["miss", "hit"]
+    assert all(payload["memory_backend"] == "sqlite" for payload in outputs)
+    assert requests == []

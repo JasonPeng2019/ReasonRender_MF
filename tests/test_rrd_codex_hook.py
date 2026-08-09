@@ -72,7 +72,7 @@ def test_pretool_rewrites_one_codex_spawn_with_current_handler_and_rrc_packet(
     monkeypatch.setenv("RRD_TARGET_ROOT", str(target))
     monkeypatch.setenv("RRD_HOOK_EVENTS", str(events))
     monkeypatch.setenv("RRC_CONTROL", "deterministic")
-    monkeypatch.setenv("OLLAMA_API_KEY", "SECRET-MUST-NOT-BE-LOGGED")
+    monkeypatch.setenv("EXAMPLE_API_KEY", "SECRET-MUST-NOT-BE-LOGGED")
     payload = {
         "hook_event_name": "PreToolUse",
         "session_id": "root",
@@ -227,6 +227,63 @@ def test_subagent_start_failure_tells_worker_to_read_shared_files_directly(
     assert event["event"] == "fail_open"
 
 
+def test_subagent_start_fifo_manifest_fails_open_without_blocking(
+    target: Path, tmp_path: Path
+) -> None:
+    script = Path(__file__).parents[1] / "contextmesh/scripts/rrd_codex_hook.py"
+    manifest = tmp_path / "seed-manifest.json"
+    os.mkfifo(manifest)
+    result = subprocess.run(
+        ["python3", str(script)],
+        input=json.dumps(
+            {
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-users",
+                "agent_type": "worker",
+            }
+        ),
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "RRD_TARGET_ROOT": str(target),
+            "RRD_HOOK_EVENTS": str(tmp_path / "events.jsonl"),
+            "RRD_SEED_MANIFEST": str(manifest),
+            "RRD_MEMORY_BACKEND": "sqlite",
+        },
+        timeout=2,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    specific = json.loads(result.stdout)["hookSpecificOutput"]
+    assert specific["hookEventName"] == "SubagentStart"
+    assert "Read src/models.js" in specific["additionalContext"]
+
+
+def test_world_readable_seed_manifest_fails_open(target: Path, tmp_path: Path, monkeypatch) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    manifest = tmp_path / "seed-manifest.json"
+    manifest.write_text('{"v":1,"seal":"invalid"}')
+    manifest.chmod(0o644)
+    monkeypatch.setenv("RRD_SEED_MANIFEST", str(manifest))
+
+    with pytest.raises(rrd_codex_hook.HookError, match="permissions must be 0600"):
+        rrd_codex_hook._manifest()
+
+
+def test_hook_event_fifo_is_best_effort_and_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    from contextmesh.scripts.rrd_codex_hook import _append_event
+
+    events = tmp_path / "events.jsonl"
+    os.mkfifo(events)
+    monkeypatch.setenv("RRD_HOOK_EVENTS", str(events))
+    started = time.monotonic()
+    _append_event("fail_open", error="fixture")
+    assert time.monotonic() - started < 0.25
+
+
 def test_subagent_start_policy_error_uses_start_fail_open_schema(
     target: Path, tmp_path: Path
 ) -> None:
@@ -324,6 +381,7 @@ def test_seed_and_subagent_start_authenticate_exactly_three_shared_digests(
     monkeypatch.setenv("RRD_HOOK_EVENTS", str(tmp_path / "events.jsonl"))
     monkeypatch.setenv("RRD_SUMMARY_MODE", "deterministic")
     monkeypatch.setenv("RRC_EVEROS_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("RRD_MEMORY_BACKEND", "everos")
     monkeypatch.setenv("RRD_SEED_MANIFEST", str(manifest))
     try:
         assert (
@@ -333,6 +391,7 @@ def test_seed_and_subagent_start_authenticate_exactly_three_shared_digests(
                     round_id="rrd-unit",
                     arm="a",
                     manifest=manifest,
+                    memory_backend="everos",
                 )
             )
             == 0
@@ -349,16 +408,77 @@ def test_seed_and_subagent_start_authenticate_exactly_three_shared_digests(
         server.server_close()
         thread.join(timeout=2)
 
+    assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
     assert output is not None
     context = output["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
     assert context.count("<<<UNTRUSTED_CONTEXTMESH_DIGEST") == 3
     assert all(path in context for path in ("src/models.js", "src/utils.js", "src/middleware.js"))
     row = json.loads((tmp_path / "events.jsonl").read_text())
     assert row["event"] == "shared_context"
+    assert row["memory_backend"] == "everos"
     assert len(row["receipts"]) == 3
 
 
-def test_subagent_stop_records_proxy_compression_receipt_without_a_continuation(
+def test_local_seed_and_shared_context_never_attempt_everos_http(
+    tmp_path: Path, target: Path, monkeypatch
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    attempts: list[object] = []
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        attempts.append((args, kwargs))
+        raise AssertionError("local digest path attempted HTTP")
+
+    manifest = tmp_path / "manifest.json"
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setattr(rrd_codex_hook.urllib.request, "urlopen", forbidden)
+    monkeypatch.setenv("RRD_TARGET_ROOT", str(target))
+    monkeypatch.setenv("RRD_HOOK_EVENTS", str(events))
+    monkeypatch.setenv("RRD_SUMMARY_MODE", "deterministic")
+    monkeypatch.setenv("RRC_EVEROS_URL", "http://127.0.0.1:9/poison")
+    monkeypatch.setenv("RRD_MEMORY_BACKEND", "sqlite")
+    monkeypatch.setenv("RRD_SEED_MANIFEST", str(manifest))
+
+    assert (
+        rrd_codex_hook._seed(
+            argparse.Namespace(
+                target_root=target,
+                round_id="rrd-sqlite-unit",
+                arm="a",
+                manifest=manifest,
+                memory_backend="sqlite",
+            )
+        )
+        == 0
+    )
+    assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
+    output = rrd_codex_hook.handle(
+        {"hook_event_name": "SubagentStart", "agent_id": "agent-users", "agent_type": "worker"}
+    )
+
+    assert attempts == []
+    assert output is not None
+    context = output["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+    assert context.count("<<<UNTRUSTED_CONTEXTMESH_DIGEST") == 3
+    seeded = json.loads(manifest.read_text())
+    assert seeded["memory_backend"] == "sqlite"
+    assert all(isinstance(row["digest"], str) for row in seeded["files"])
+    row = json.loads(events.read_text())
+    assert row["memory_backend"] == "sqlite"
+
+    monkeypatch.setenv("RRD_MEMORY_BACKEND", "everos")
+    with pytest.raises(rrd_codex_hook.HookError, match="memory backend"):
+        rrd_codex_hook.handle(
+            {
+                "hook_event_name": "SubagentStart",
+                "agent_id": "cross-backend-agent",
+                "agent_type": "worker",
+            }
+        )
+
+
+def test_subagent_stop_records_native_compression_receipt_without_a_continuation(
     tmp_path: Path, monkeypatch
 ) -> None:
     from contextmesh.scripts.rrd_codex_hook import handle
@@ -378,25 +498,31 @@ def test_subagent_stop_records_proxy_compression_receipt_without_a_continuation(
     )
 
     assert output == {}
-    row = json.loads(events.read_text())
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    row = rows[0]
     assert row["event"] == "result_final"
     assert row["compressed"] is True
     assert row["compression_receipt"] == "0123456789abcdefabcd"
     assert row["delivered_chars"] > 0
     assert len(row["delivered_sha256"]) == 64
+    assert rows[1]["event"] == "native_usage_missing"
 
 
-def test_wait_hook_records_only_observed_completed_agents(tmp_path: Path, monkeypatch) -> None:
+def test_wait_hook_records_completed_agents_but_fails_open_on_terminal_error(
+    tmp_path: Path, monkeypatch
+) -> None:
     from contextmesh.scripts.rrd_codex_hook import handle
 
     events = tmp_path / "events.jsonl"
     monkeypatch.setenv("RRD_HOOK_EVENTS", str(events))
+    monkeypatch.setenv("RRD_RAW_RESULTS", str(tmp_path / "raw-results"))
     assert (
         handle(
             {
                 "hook_event_name": "PostToolUse",
                 "tool_name": "multi_agent_v1wait_agent",
                 "tool_use_id": "call-wait",
+                "tool_input": {"targets": ["agent-users", "agent-orders"]},
                 "tool_response": json.dumps(
                     {
                         "status": {
@@ -411,18 +537,138 @@ def test_wait_hook_records_only_observed_completed_agents(tmp_path: Path, monkey
         is None
     )
 
-    row = json.loads(events.read_text())
-    assert row["event"] == "wait_result"
-    assert row["agent_ids"] == ["agent-orders", "agent-users"]
-    assert row["completed_agent_ids"] == ["agent-users"]
-    assert row["completed_results"] == {
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert rows[0]["event"] == "wait_result"
+    assert rows[0]["agent_ids"] == ["agent-orders", "agent-users"]
+    assert rows[0]["completed_agent_ids"] == ["agent-users"]
+    assert rows[0]["completed_results"] == {
         "agent-users": {
             "chars": len("users report"),
             "sha256": hashlib.sha256(b"users report").hexdigest(),
         }
     }
-    assert row["result_count"] == 1
-    assert row["timed_out"] is False
+    assert rows[0]["result_count"] == 1
+    assert rows[0]["timed_out"] is False
+    assert rows[1]["event"] == "compress_fail_open"
+
+
+def test_stop_records_strict_native_transcript_usage(tmp_path: Path, monkeypatch) -> None:
+    from contextmesh.scripts.rrd_codex_hook import handle
+
+    home = tmp_path / "home"
+    home.mkdir()
+    transcript = home / "rollout.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "thread-root"}})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 90,
+                            "cached_input_tokens": 20,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 4,
+                            "total_tokens": 100,
+                        }
+                    },
+                },
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}})
+        + "\n"
+    )
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("RRD_HOOK_EVENTS", str(events))
+
+    assert (
+        handle(
+            {
+                "hook_event_name": "Stop",
+                "last_assistant_message": "final report",
+                "transcript_path": str(transcript),
+            }
+        )
+        == {}
+    )
+
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["root_merge", "native_usage"]
+    usage = rows[1]
+    assert usage["component"] == "root"
+    assert usage["session_id"] == "thread-root"
+    assert usage["total_tokens"] == 100
+
+
+def test_native_usage_rejects_nonfinal_regressed_and_failed_transcripts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from contextmesh.scripts.rrd_codex_hook import HookError, _native_usage
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    base_usage = {
+        "input_tokens": 90,
+        "cached_input_tokens": 20,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 10,
+        "reasoning_output_tokens": 4,
+        "total_tokens": 100,
+    }
+
+    def write(rows: list[dict[str, object]]) -> Path:
+        path = home / "rollout.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return path
+
+    prefix = [
+        {"type": "session_meta", "payload": {"id": "thread-root"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": base_usage},
+            },
+        },
+    ]
+    payload = {"transcript_path": str(home / "rollout.jsonl")}
+    write([*prefix, {"type": "response_item", "payload": {"type": "message"}}])
+    with pytest.raises(HookError, match="activity after final"):
+        _native_usage(payload, component="root")
+
+    regressed = {**base_usage, "input_tokens": 40, "total_tokens": 50}
+    write(
+        [
+            *prefix,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": regressed},
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        ]
+    )
+    with pytest.raises(HookError, match="regressed"):
+        _native_usage(payload, component="root")
+
+    write(
+        [
+            *prefix,
+            {"type": "event_msg", "payload": {"type": "stream_error"}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        ]
+    )
+    with pytest.raises(HookError, match="failure event"):
+        _native_usage(payload, component="root")
 
 
 def test_everos_body_read_has_a_wall_clock_deadline() -> None:

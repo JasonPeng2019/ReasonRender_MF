@@ -1,6 +1,6 @@
 #!/bin/bash
-# Backward-compatible EverOS-backed ContextMesh + ReasonRenderCoding demo.
+# EverOS-free local SQLite ContextMesh + ReasonRenderCoding demo.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export RRD_MEMORY_BACKEND=everos
+export RRD_MEMORY_BACKEND=sqlite
 exec "$ROOT/scripts/rrd_demo.sh" "$@"

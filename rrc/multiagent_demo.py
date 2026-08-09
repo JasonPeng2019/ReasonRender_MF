@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
 import signal
+import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -227,7 +230,7 @@ class _NoopCaseIndex:
 
 @dataclass(frozen=True)
 class AssignmentResolution:
-    """One rendered packet ready to append to a real OpenCode worker task."""
+    """One rendered packet ready to append to a native Codex worker task."""
 
     task_id: str
     handler: str
@@ -294,7 +297,7 @@ def resolve_assignment(
         planner,
         planner_model,
         _worker_passthrough,
-        "opencode-worker",
+        "native-codex-worker",
         cast(SQLiteTemplateStore, active_store),
         cast(EverOSClient, active_index),
         policy=AUDIT_POLICY,
@@ -372,13 +375,32 @@ def packet_output_schema(task: OrchestratorTask) -> dict[str, object]:
 
 
 def _append_jsonl(path: Path, event: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, line)
-    finally:
-        os.close(descriptor)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        descriptor = os.open(
+            path,
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return
+            view = memoryview(line)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    return
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+    except Exception:
+        # Evidence is best-effort and must not mask the planner result or its error.
+        return
 
 
 def _recover_codex_usage(stdout: str) -> dict[str, int] | None:
@@ -416,6 +438,15 @@ def _nonnegative_integer(value: object) -> int | None:
     return None
 
 
+def _credential_free_environment(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    if env is None:
+        return None
+    blocked = re.compile(
+        r"(API_?KEY|ACCESS_?TOKEN|SECRET|PASSWORD|CREDENTIAL|COOKIE|AUTH_?TOKEN)", re.I
+    )
+    return {name: value for name, value in env.items() if blocked.search(name) is None}
+
+
 class CodexPacketPlanner:
     """One structured Codex planner completion with durable raw evidence."""
 
@@ -437,7 +468,7 @@ class CodexPacketPlanner:
         self._artifact_log = Path(artifact_log)
         self._executable = executable
         self._timeout = timeout
-        self._env = None if env is None else dict(env)
+        self._env = _credential_free_environment(env)
         self._run = run
 
     def __call__(self, prompt: str, model: str) -> tuple[str, int]:
@@ -445,6 +476,11 @@ class CodexPacketPlanner:
         command = [
             self._executable,
             "exec",
+            "--strict-config",
+            "-c",
+            "features.hooks=false",
+            "-c",
+            "features.multi_agent=false",
             "--json",
             "--ignore-rules",
             "--ephemeral",
@@ -570,8 +606,63 @@ class CodexPacketPlanner:
         return normalized_response, usage.total_tokens
 
 
-class RoundCaseIndex(EverOSClient):
-    """Round-isolated RRC case index for one combined demo arm."""
+def _case_shape_sha(case_shape: str) -> str:
+    return hashlib.sha256(case_shape.encode()).hexdigest()
+
+
+class SQLiteCaseIndex:
+    """Exact round-scoped case/ref mapping in the packet database."""
+
+    def __init__(self, database: Path, round_id: str) -> None:
+        self._database = database
+        self._round_id = round_id
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rrd_case_index (
+                    round_id TEXT NOT NULL,
+                    case_shape_sha256 TEXT NOT NULL,
+                    case_shape TEXT NOT NULL,
+                    external_ref TEXT NOT NULL,
+                    PRIMARY KEY (round_id, case_shape_sha256)
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._database, timeout=5)
+
+    def search(self, case_shape: str) -> list[tuple[str, float]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT case_shape, external_ref FROM rrd_case_index
+                WHERE round_id = ? AND case_shape_sha256 = ?
+                """,
+                (self._round_id, _case_shape_sha(case_shape)),
+            ).fetchone()
+        if row is None or row[0] != case_shape or not isinstance(row[1], str) or not row[1]:
+            return []
+        return [(row[1], 1.0)]
+
+    def index(self, case_shape: str, external_ref: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rrd_case_index
+                    (round_id, case_shape_sha256, case_shape, external_ref)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(round_id, case_shape_sha256) DO UPDATE SET
+                    case_shape = excluded.case_shape,
+                    external_ref = excluded.external_ref
+                """,
+                (self._round_id, _case_shape_sha(case_shape), case_shape, external_ref),
+            )
+
+
+class RoundEverOSCaseIndex(EverOSClient):
+    """Round-isolated exact EverOS record store with no extraction flush."""
 
     def __init__(self, base_url: str, round_id: str) -> None:
         super().__init__(base_url)
@@ -579,6 +670,73 @@ class RoundCaseIndex(EverOSClient):
         if not safe_round:
             raise ValueError("round_id must contain a letter or number")
         self.PROJECT_ID = f"rrc-demo-{safe_round[:80]}"
+        self._round_id = round_id
+
+    def _session_id(self, case_shape: str) -> str:
+        return f"rrc:{self.PROJECT_ID}:{_case_shape_sha(case_shape)}"
+
+    def index(self, case_shape: str, external_ref: str) -> None:
+        record = {
+            "v": 1,
+            "round_id": self._round_id,
+            "case_shape_sha256": _case_shape_sha(case_shape),
+            "case_shape": case_shape,
+            "external_ref": external_ref,
+        }
+        response = self._post(
+            "/api/v2/memory/add",
+            {
+                "session_id": self._session_id(case_shape),
+                "app_id": self.APP_ID,
+                "project_id": self.PROJECT_ID,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "sender_id": self.USER_ID,
+                        "timestamp": int(time.time() * 1000),
+                        "content": json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                    }
+                ],
+            },
+        )
+        if response.get("data", {}).get("status") != "accumulated":
+            raise RuntimeError("EverOS did not acknowledge RRD case record")
+
+    def search(self, case_shape: str) -> list[tuple[str, float]]:
+        response = self._post(
+            "/api/v2/memory/search",
+            {
+                "user_id": self.USER_ID,
+                "app_id": self.APP_ID,
+                "project_id": self.PROJECT_ID,
+                "query": "case-index",
+                "method": "keyword",
+                "filters": {"session_id": self._session_id(case_shape)},
+            },
+        )
+        data = response.get("data")
+        messages = data.get("unprocessed_messages") if isinstance(data, dict) else None
+        for message in messages if isinstance(messages, list) else []:
+            content = message.get("content") if isinstance(message, dict) else None
+            try:
+                record = json.loads(content) if isinstance(content, str) else None
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("v") == 1
+                and record.get("round_id") == self._round_id
+                and record.get("case_shape_sha256") == _case_shape_sha(case_shape)
+                and record.get("case_shape") == case_shape
+                and isinstance(record.get("external_ref"), str)
+                and record["external_ref"]
+            ):
+                return [(str(record["external_ref"]), 1.0)]
+        return []
+
+
+# Compatibility name for callers that imported the earlier demo-only class.
+RoundCaseIndex = RoundEverOSCaseIndex
 
 
 def wait_for_external_ref(
@@ -637,12 +795,21 @@ def _result_payload(result: AssignmentResolution) -> dict[str, object]:
     }
 
 
+def _case_index_for(args: argparse.Namespace) -> CaseIndex:
+    if args.memory_backend == "everos":
+        if not args.everos_url:
+            raise ValueError("--everos-url is required for the EverOS memory backend")
+        return RoundEverOSCaseIndex(args.everos_url, args.round_id)
+    return SQLiteCaseIndex(args.database, args.round_id)
+
+
 def _resolve_cli(args: argparse.Namespace) -> int:
     task, _handler = audit_task(args.task_id, args.task_prompt)
     planner = CodexPacketPlanner(
         model=args.model,
         task=task,
         artifact_log=args.model_events,
+        executable=os.environ.get("RRD_CODEX_BIN", "codex"),
         timeout=args.planner_timeout,
         env={
             **os.environ,
@@ -653,7 +820,6 @@ def _resolve_cli(args: argparse.Namespace) -> int:
             ),
         },
     )
-    case_index = RoundCaseIndex(args.everos_url, args.round_id)
     try:
         if args.mode == "warm":
             Path(args.lock).parent.mkdir(parents=True, exist_ok=True)
@@ -661,6 +827,7 @@ def _resolve_cli(args: argparse.Namespace) -> int:
                 lock_wait = acquire_exclusive_lock(lock_stream, timeout=args.lock_timeout)
                 lock_wait_ms = round(lock_wait * 1000)
                 store: PacketStore = SQLiteTemplateStore(args.database)
+                case_index = _case_index_for(args)
                 result = resolve_assignment(
                     task_id=args.task_id,
                     task_prompt=args.task_prompt,
@@ -680,6 +847,7 @@ def _resolve_cli(args: argparse.Namespace) -> int:
         else:
             lock_wait_ms = 0
             store = _NoopPacketStore()
+            case_index = _NoopCaseIndex()
             result = resolve_assignment(
                 task_id=args.task_id,
                 task_prompt=args.task_prompt,
@@ -689,7 +857,12 @@ def _resolve_cli(args: argparse.Namespace) -> int:
                 case_index=case_index,
                 planner_model=args.model,
             )
-        payload = {**_result_payload(result), "mode": args.mode, "lock_wait_ms": lock_wait_ms}
+        payload = {
+            **_result_payload(result),
+            "mode": args.mode,
+            "memory_backend": args.memory_backend,
+            "lock_wait_ms": lock_wait_ms,
+        }
         _append_jsonl(Path(args.events), {"ts": time.time(), "event": "packet", **payload})
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 0
@@ -703,6 +876,7 @@ def _resolve_cli(args: argparse.Namespace) -> int:
                 "source": "python_bridge",
                 "task_id": args.task_id,
                 "mode": args.mode,
+                "memory_backend": args.memory_backend,
                 "error": str(exc),
             },
         )
@@ -714,6 +888,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     resolve = commands.add_parser("resolve", help="resolve one Codex worker audit packet")
     resolve.add_argument("--mode", choices=("cold", "warm"), required=True)
+    resolve.add_argument("--memory-backend", choices=("everos", "sqlite"), required=True)
     resolve.add_argument("--round-id", required=True)
     resolve.add_argument("--task-id", required=True)
     resolve.add_argument("--task-prompt", required=True)
@@ -722,7 +897,7 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--events", type=Path, required=True)
     resolve.add_argument("--model-events", type=Path, required=True)
     resolve.add_argument("--model", required=True)
-    resolve.add_argument("--everos-url", required=True)
+    resolve.add_argument("--everos-url")
     resolve.add_argument(
         "--planner-timeout",
         type=float,

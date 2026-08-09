@@ -64,10 +64,8 @@ search needs embeddings and is not necessary for the minimum Lane B contract.
 ## Model-provider note
 
 The native Codex CLI is authenticated and works when it uses its configured
-default model. This account rejects a hard-coded `gpt-5` model name, so a host
-must pass a model that its own Codex account supports. Ollama's
-OpenAI-compatible endpoint also returned successful completions during this
-validation. For a fully live planner, give the provider an enforced JSON schema
+default model. A host must pass a model that its own Codex account supports.
+For a fully live planner, give Codex an enforced JSON schema
 for `PlanSpecPacket` (or validate/retry at the host boundary): some general
 models emit incomplete packet fields even though the Lane B runtime correctly
 rejects them.

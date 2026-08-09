@@ -1,4 +1,4 @@
-"""COLD-vs-WARM runner and meter for the OpenCode ReasonRenderCoding demo."""
+"""COLD-vs-WARM runner and meter for the native Codex ReasonRenderCoding demo."""
 
 from __future__ import annotations
 
@@ -235,7 +235,7 @@ def format_meter(
 
 
 def format_arm_report(evidence: Mapping[str, object]) -> str:
-    """Format one tool result for direct display inside the OpenCode TUI."""
+    """Format one tool result for direct display inside the native Codex TUI."""
 
     arm = str(evidence.get("arm", "unknown")).upper()
     proof = "PASS" if evidence.get("proof_pass") is True else "FAIL"
@@ -294,7 +294,7 @@ def _waiting_meter(round_id: str, missing: Sequence[str]) -> str:
     lines = ["┌" + title.center(METER_WIDTH - 2, "─") + "┐"]
     lines.append(_box("Waiting for " + " and ".join(missing)))
     lines.append(
-        _box("Start side A and side B in their OpenCode terminals, then paste the shared prompt.")
+        _box("Start side A and side B in their Codex terminals, then paste the shared prompt.")
     )
     lines.append("└" + "─" * (METER_WIDTH - 2) + "┘")
     return "\n".join(lines)
@@ -352,7 +352,7 @@ def _parser() -> argparse.ArgumentParser:
     meter.add_argument("--round-id")
     meter.add_argument("--watch", action="store_true")
 
-    report = commands.add_parser("report", help="format one saved arm for the OpenCode tool")
+    report = commands.add_parser("report", help="format one saved arm for the Codex tool")
     report.add_argument("--evidence", type=Path, required=True)
     return parser
 

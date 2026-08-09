@@ -1,77 +1,49 @@
-#!/usr/bin/env bash
-# Local preflight for the Codex + Ollama ContextMesh/RRC demo.
-set -uo pipefail
+#!/bin/bash
+# Validate the native Codex ContextMesh/RRC demo without reading local secret files.
+set -euo pipefail
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck disable=SC1091
-source "$ROOT/.env.local"
-fail=0
-CODEX_BIN="${RRD_CODEX_BIN:-codex}"
-PREFLIGHT_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/rrd-codex-preflight.XXXXXX")" || {
-  echo "FAIL  could not create isolated Codex preflight home" >&2
-  exit 1
-}
-trap 'rm -rf "$PREFLIGHT_CODEX_HOME"' EXIT
+BACKEND="${RRD_MEMORY_BACKEND:-}"
+case "$BACKEND" in everos|sqlite) ;; *) echo "FAIL  invalid RRD_MEMORY_BACKEND" >&2; exit 2 ;; esac
 
-check() {
-  local name="$1"; shift
-  if "$@" >/dev/null 2>&1; then echo "PASS  $name"; else echo "FAIL  $name"; fail=1; fi
-}
-
-# Invoked indirectly through check().
-# shellcheck disable=SC2329
-codex_version_ok() {
-  test "$("$CODEX_BIN" --version)" = "codex-cli 0.147.0"
-}
-
-# shellcheck disable=SC2329
-codex_feature_enabled() {
-  local features
-  features="$(CODEX_HOME="$PREFLIGHT_CODEX_HOME" "$CODEX_BIN" features list)" || return
-  grep -Eq "^$1[[:space:]]+stable[[:space:]]+true" <<<"$features"
-}
-
-# shellcheck disable=SC2329
-prompt_is_codex_native() {
-  ! grep -Eq "task tool|subagent_type" "$ROOT/RRD-demo-prompt.txt"
-}
-
-check "RRD Tollgate :8789 healthz" curl -sf -m 5 http://127.0.0.1:8789/healthz
-check "RRD response proxy :8790 healthz" curl -sf -m 5 http://127.0.0.1:8790/healthz
-check "EverOS :8000 health" curl -sf -m 5 http://127.0.0.1:8000/health
-check "OLLAMA_API_KEY is configured" test -n "${OLLAMA_API_KEY:-}"
-check "CONTEXTMESH_MODEL is configured" test -n "${CONTEXTMESH_MODEL:-}"
-check "Codex CLI is installed" command -v "$CODEX_BIN"
-check "Codex CLI matches tested 0.147.0 wire contract" codex_version_ok
-check "uv is installed" command -v "${RRC_DEMO_UV_BIN:-uv}"
-check "Codex hooks feature is available" codex_feature_enabled hooks
-check "Codex multi-agent feature is available" codex_feature_enabled multi_agent
-check "Codex hook adapter is present" test -f "$ROOT/scripts/rrd_codex_hook.py"
-check "Codex-native audit prompt has no OpenCode task syntax" prompt_is_codex_native
-
-if [ "${1:-}" = "--canary" ]; then
-  echo "Running one optional live Ollama Responses canary (this consumes a few tokens)…"
-  if OLLAMA_API_KEY="$OLLAMA_API_KEY" CONTEXTMESH_MODEL="$CONTEXTMESH_MODEL" python3 - <<'PY'
-import json, os, urllib.request
-request=urllib.request.Request(
-    "http://127.0.0.1:8789/ollama/setup-canary-root/v1/responses",
-    data=json.dumps({"model":os.environ["CONTEXTMESH_MODEL"],"input":"Reply with OK.","stream":False,"max_output_tokens":8}).encode(),
-    headers={"Authorization":"Bearer "+os.environ["OLLAMA_API_KEY"],"Content-Type":"application/json"},
-    method="POST",
-)
-with urllib.request.urlopen(request, timeout=60) as response:
-    body=json.loads(response.read())
-if not isinstance(body, dict) or not body.get("id"):
-    raise SystemExit("response lacked an id")
-print("PASS  Ollama Responses canary")
-PY
-  then :; else
-    echo "FAIL  Ollama Responses canary"; fail=1
-  fi
+CODEX_CANDIDATE="${RRD_CODEX_BIN:-$(command -v codex || true)}"
+[ -n "$CODEX_CANDIDATE" ] || { echo "FAIL  Codex is not installed" >&2; exit 1; }
+CODEX_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_CANDIDATE")"
+MODEL="${RRD_CODEX_MODEL:-gpt-5.5}"
+CODEX_COMMAND=("$CODEX_BIN")
+if [ "$(uname -s)" = Darwin ]; then
+  [ -x /usr/bin/sandbox-exec ] || { echo "FAIL  macOS sandbox-exec is unavailable" >&2; exit 1; }
+  CODEX_COMMAND=(/usr/bin/sandbox-exec -f "$ROOT/.codex-rrd-native/credential-deny.sb" \
+    "$CODEX_BIN" --dangerously-bypass-approvals-and-sandbox)
 fi
 
-if [ "$fail" = 0 ]; then
-  echo "ALL GREEN — Codex uses the custom Ollama provider; codex login is not required."
+python3 "$ROOT/scripts/rrd_native_config.py" check --root "$ROOT" \
+  --codex-bin "$CODEX_BIN" --model "$MODEL"
+
+if [ "$BACKEND" = everos ]; then
+  /usr/bin/curl -sf -m 5 http://127.0.0.1:8000/health >/dev/null
+  echo "PASS  EverOS :8000 is healthy"
 else
-  echo "NOT READY — fix FAILs above, then rerun $ROOT/RRDdemo.sh prep."
+  echo "PASS  local SQLite mode requires no service"
 fi
-exit "$fail"
+
+if [ "${1:-}" = --canary ]; then
+  echo "Running one native Codex canary…"
+  /usr/bin/env -i HOME="$HOME" CODEX_HOME="$ROOT/.codex-rrd-native" \
+    PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    LANG="${LANG:-en_US.UTF-8}" LC_ALL="${LC_ALL:-en_US.UTF-8}" \
+    "${CODEX_COMMAND[@]}" exec --strict-config --json --ephemeral --ignore-rules \
+    --skip-git-repo-check --model "$MODEL" \
+    "Reply with exactly OK." | python3 -c '
+import json,sys
+message=""; usage=None
+for line in sys.stdin:
+    event=json.loads(line)
+    item=event.get("item",{})
+    if event.get("type")=="item.completed" and item.get("type")=="agent_message": message=item.get("text","").strip()
+    if event.get("type")=="turn.completed": usage=event.get("usage")
+if message != "OK" or not isinstance(usage,dict): raise SystemExit("native canary failed")
+print("PASS  native Codex model canary", json.dumps(usage,separators=(",",":")))'
+fi
+
+echo "ALL GREEN — native Codex authentication and model configuration are ready."

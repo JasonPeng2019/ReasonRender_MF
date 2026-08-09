@@ -1,0 +1,363 @@
+{
+  "rubric_version": 1,
+  "preregistered_at_utc": "2026-08-09T05:00:34Z",
+  "scope": [
+    "input-validation",
+    "authorization",
+    "error-handling"
+  ],
+  "method": "Independent source-only audit completed before inspecting any experiment outputs.",
+  "severity_scale": {
+    "critical": "Direct cross-tenant compromise or material financial manipulation by an ordinary caller.",
+    "high": "Unauthorized disclosure/mutation or material integrity impact with modest prerequisites.",
+    "medium": "Concrete integrity, policy, or validation failure with bounded impact or a privileged prerequisite.",
+    "low": "Malformed-input or response/error-contract defect with limited direct security impact."
+  },
+  "source_sha256": {
+    "src/handlers/users.js": "5064dad0f63e2073d80e91a3bfdbda9501fb7c3ed396aae9328fe1a3f1250b8b",
+    "src/handlers/products.js": "226ccda06a3ccc61968b1ba981783cc7ed21996886d9dbf9b600d83452715ffd",
+    "src/handlers/orders.js": "2396fcbe4adee495c2956114d24cc5f121fd0876e27659355074dccc3eea2500",
+    "src/handlers/reviews.js": "ea7c845f0f22bcf368c409cc9a90ec90d8e27522e74aa18261ba2111329407a0",
+    "src/models.js": "7a9773f6fae6500156793d21b4a31770a866df7f30e6a01eb99dbba240dd27c4",
+    "src/utils.js": "c964e7643e5cadaafddee969debcca60f30f345ed1f132ef5e1060dc330e6a64",
+    "src/middleware.js": "f4653b4f74d8185940157e34eb8e1e7a8c88d8a3c9e60a39e5a8cccb52354fa2"
+  },
+  "findings": [
+    {
+      "stable_id": "USR-VAL-001",
+      "handler": "users",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/users.js:17-31",
+      "exploit_impact": "Registration never validates that password exists, is a string, or has any strength; hashPassword stringifies undefined, so an account can be created and later logged into with an omitted password.",
+      "aliases": [
+        "missing password validation",
+        "passwordless registration",
+        "undefined password",
+        "validateUser omits password",
+        "hashPassword String undefined"
+      ]
+    },
+    {
+      "stable_id": "USR-AUTHZ-001",
+      "handler": "users",
+      "category": "authorization",
+      "severity": "high",
+      "file_line": "src/handlers/users.js:82-95",
+      "exploit_impact": "PATCH /users/:id authenticates the caller but never requires req.user.id to equal the target id, allowing any logged-in user to change another user's profile and email.",
+      "aliases": [
+        "IDOR",
+        "broken object level authorization",
+        "missing ownership check",
+        "edit another user",
+        "profile takeover"
+      ]
+    },
+    {
+      "stable_id": "USR-VAL-002",
+      "handler": "users",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/users.js:89-93",
+      "exploit_impact": "The profile patch writes displayName, marketingOptIn, and email without reusing validateUser or checking email uniqueness, permitting invalid types/values and duplicate or malformed email identities.",
+      "aliases": [
+        "PATCH validation missing",
+        "malformed email",
+        "duplicate email",
+        "marketingOptIn wrong type",
+        "empty displayName"
+      ]
+    },
+    {
+      "stable_id": "PRD-VAL-001",
+      "handler": "products",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/products.js:87-93",
+      "exploit_impact": "Product updates copy arbitrary field values without validateProduct or text sanitization, allowing negative/non-integer prices or stock, invalid categories, non-boolean active values, and malformed text/attributes.",
+      "aliases": [
+        "PATCH product validation missing",
+        "negative price",
+        "negative stock",
+        "invalid category",
+        "unsanitized title"
+      ]
+    },
+    {
+      "stable_id": "PRD-AUTHZ-001",
+      "handler": "products",
+      "category": "authorization",
+      "severity": "high",
+      "file_line": "src/handlers/products.js:98-107",
+      "exploit_impact": "DELETE /products/:id checks only for a seller/admin role and omits the ownership test used by PATCH, so any seller can delete another seller's listing.",
+      "aliases": [
+        "delete IDOR",
+        "missing seller ownership",
+        "delete another seller product",
+        "broken object authorization"
+      ]
+    },
+    {
+      "stable_id": "PRD-AUTHZ-002",
+      "handler": "products",
+      "category": "authorization",
+      "severity": "high",
+      "file_line": "src/handlers/products.js:112-123",
+      "exploit_impact": "POST /products/:id/restock also checks only the role and not product.sellerId, allowing any seller to alter a competitor's inventory.",
+      "aliases": [
+        "restock IDOR",
+        "missing restock ownership",
+        "alter competitor stock",
+        "broken object authorization"
+      ]
+    },
+    {
+      "stable_id": "PRD-VAL-002",
+      "handler": "products",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/products.js:120-122",
+      "exploit_impact": "Restock accepts delta without a type, integer, range, or resulting-stock check; strings concatenate, undefined produces NaN, and negative deltas can make inventory negative.",
+      "aliases": [
+        "unvalidated delta",
+        "negative restock",
+        "NaN stock",
+        "string concatenation stock",
+        "inventory underflow"
+      ]
+    },
+    {
+      "stable_id": "PRD-VAL-003",
+      "handler": "products",
+      "category": "input-validation",
+      "severity": "low",
+      "file_line": "src/handlers/products.js:46-58",
+      "exploit_impact": "minPrice and maxPrice are converted with Number but never checked for finiteness, non-negativity, ordering, or integer cents, so malformed bounds are silently ignored or yield misleading empty results instead of a 400.",
+      "aliases": [
+        "invalid price filter",
+        "NaN minPrice",
+        "NaN maxPrice",
+        "min greater than max",
+        "query validation"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-001",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "critical",
+      "file_line": "src/handlers/orders.js:17-29",
+      "exploit_impact": "Order creation totals client-supplied unitPriceCents and never resolves SKUs against products or uses the catalog price/stock, so a customer can order arbitrary/nonexistent SKUs at zero or attacker-chosen prices.",
+      "aliases": [
+        "price tampering",
+        "client supplied price",
+        "trusts unitPriceCents",
+        "no product lookup",
+        "nonexistent SKU",
+        "catalog price bypass"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-002",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "high",
+      "file_line": "src/handlers/orders.js:23-29",
+      "exploit_impact": "Coupon application checks only that the coupon exists; it does not reject expired coupons or enforce minTotalCents before applyCoupon grants the discount.",
+      "aliases": [
+        "expired coupon accepted",
+        "coupon expiry missing",
+        "minimum total ignored",
+        "minTotalCents",
+        "coupon eligibility"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-003",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/orders.js:17-40",
+      "exploit_impact": "shippingAddress is optional during validation and falls back to req.user.addresses[0] only after validation, so a user with no saved address can create an order whose shippingAddress is undefined.",
+      "aliases": [
+        "missing shipping address",
+        "undefined shippingAddress",
+        "empty address book",
+        "fallback not validated"
+      ]
+    },
+    {
+      "stable_id": "ORD-AUTHZ-001",
+      "handler": "orders",
+      "category": "authorization",
+      "severity": "high",
+      "file_line": "src/handlers/orders.js:47-54",
+      "exploit_impact": "GET /orders?all=1 honors all=1 for every authenticated role rather than admins only, exposing every customer's order items and shipping address.",
+      "aliases": [
+        "all orders authorization bypass",
+        "all=1 IDOR",
+        "cross-user order disclosure",
+        "missing admin check",
+        "shipping address leak"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-004",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/orders.js:72-84",
+      "exploit_impact": "Cancellation performs no status-transition check, so an owner can cancel shipped, delivered, already cancelled, or refunded orders despite the route promising only not-yet-shipped cancellation.",
+      "aliases": [
+        "cancel delivered order",
+        "cancel shipped order",
+        "invalid state transition",
+        "missing order status check"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-005",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "high",
+      "file_line": "src/handlers/orders.js:88-100",
+      "exploit_impact": "Refund amountCents is accepted without integer, non-negative, or upper-bound validation, permitting negative or over-total refund records and malformed monetary state.",
+      "aliases": [
+        "over-refund",
+        "negative refund",
+        "unvalidated amountCents",
+        "refund exceeds total",
+        "noninteger refund"
+      ]
+    },
+    {
+      "stable_id": "ORD-VAL-006",
+      "handler": "orders",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/orders.js:88-100",
+      "exploit_impact": "The refund route never verifies that the order is delivered, allowing refunds from pending, paid, shipped, cancelled, or already refunded states.",
+      "aliases": [
+        "refund undelivered order",
+        "double refund",
+        "invalid refund state",
+        "missing delivered check"
+      ]
+    },
+    {
+      "stable_id": "ORD-ERR-001",
+      "handler": "orders",
+      "category": "error-handling",
+      "severity": "low",
+      "file_line": "src/handlers/orders.js:104-118",
+      "exploit_impact": "Coupon creation performs no duplicate-code check; insert throws on an existing id, so an ordinary conflict is routed through asyncHandler as a generic 500 instead of a controlled 409.",
+      "aliases": [
+        "duplicate coupon 500",
+        "coupon conflict unhandled",
+        "insert duplicate id",
+        "missing 409"
+      ]
+    },
+    {
+      "stable_id": "REV-AUTHZ-001",
+      "handler": "reviews",
+      "category": "authorization",
+      "severity": "medium",
+      "file_line": "src/handlers/reviews.js:10-17",
+      "exploit_impact": "The route is specified for customer reviews but uses requireAuth without requireRole('customer'), so seller, support, and admin accounts can create consumer reviews.",
+      "aliases": [
+        "missing customer role",
+        "seller can review",
+        "admin can review",
+        "support can review",
+        "role authorization"
+      ]
+    },
+    {
+      "stable_id": "REV-VAL-001",
+      "handler": "reviews",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/reviews.js:28-36",
+      "exploit_impact": "verifiedPurchase becomes true for any matching order regardless of status, so pending, cancelled, or refunded purchases receive the trusted verified-purchase badge.",
+      "aliases": [
+        "false verified purchase",
+        "cancelled order counts",
+        "pending order counts",
+        "order status ignored",
+        "verifiedPurchase"
+      ]
+    },
+    {
+      "stable_id": "REV-VAL-002",
+      "handler": "reviews",
+      "category": "input-validation",
+      "severity": "low",
+      "file_line": "src/handlers/reviews.js:46-59",
+      "exploit_impact": "minRating is parsed but not checked for NaN, integer form, or the 1-5 range, so malformed filters are silently ignored or produce misleading results instead of a 400.",
+      "aliases": [
+        "invalid minRating",
+        "NaN rating filter",
+        "rating range missing",
+        "query validation"
+      ]
+    },
+    {
+      "stable_id": "REV-VAL-003",
+      "handler": "reviews",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/reviews.js:63-74",
+      "exploit_impact": "The flag endpoint appends req.body.flag without checking REVIEW_FLAGS, allowing missing, arbitrary, or non-string flag values despite importing the allowed enum.",
+      "aliases": [
+        "invalid review flag",
+        "REVIEW_FLAGS unused",
+        "unknown flag accepted",
+        "flag enum validation"
+      ]
+    },
+    {
+      "stable_id": "REV-AUTHZ-002",
+      "handler": "reviews",
+      "category": "authorization",
+      "severity": "high",
+      "file_line": "src/handlers/reviews.js:63-77",
+      "exploit_impact": "Flags are not tied to unique flagging users, so one authenticated account can submit the same flag three times and automatically hide any review.",
+      "aliases": [
+        "duplicate flags",
+        "self censorship",
+        "single user hides review",
+        "repeat flag",
+        "flag stuffing"
+      ]
+    },
+    {
+      "stable_id": "REV-VAL-004",
+      "handler": "reviews",
+      "category": "input-validation",
+      "severity": "medium",
+      "file_line": "src/handlers/reviews.js:82-93",
+      "exploit_impact": "Moderation does not require hidden to be boolean; every value other than literal true, including an omitted field, silently unhides the review and clears all flags.",
+      "aliases": [
+        "moderation boolean missing",
+        "omitted hidden unhides",
+        "hidden type validation",
+        "clears flags"
+      ]
+    },
+    {
+      "stable_id": "REV-ERR-001",
+      "handler": "reviews",
+      "category": "error-handling",
+      "severity": "low",
+      "file_line": "src/handlers/reviews.js:71-78",
+      "exploit_impact": "On the third flag the handler stores hidden=true in a second update but returns the stale object from the first update, falsely reporting hidden=false while the resource is hidden.",
+      "aliases": [
+        "stale flag response",
+        "hidden response mismatch",
+        "third flag",
+        "updated before hidden"
+      ]
+    }
+  ]
+}

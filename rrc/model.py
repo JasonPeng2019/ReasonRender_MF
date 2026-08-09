@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -253,23 +254,26 @@ class CodexModel(ModelPort):
         """Return exactly one typed completion with provider-reported usage."""
 
         model = self._models[role]
-        command = [
-            self._executable,
-            "exec",
-            "--json",
-            # Artifact calls must not inherit repository AGENTS instructions:
-            # those add thousands of irrelevant tokens and can conflict with
-            # the strict JSON/code-only stage contract.
-            "--ignore-rules",
-            # RRC persists its own typed evidence; do not create a full Codex
-            # session rollout for every single-stage completion.
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--model",
-            model,
-        ]
+        command = [self._executable]
+        if os.environ.get("RRD_EXTERNAL_SANDBOX") == "1":
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        command.extend(
+            [
+                "exec",
+                "--json",
+                # Artifact calls must not inherit repository AGENTS instructions:
+                # those add thousands of irrelevant tokens and can conflict with
+                # the strict JSON/code-only stage contract.
+                "--ignore-rules",
+                # RRC persists its own typed evidence; do not create a full Codex
+                # session rollout for every single-stage completion.
+                "--ephemeral",
+                "--skip-git-repo-check",
+            ]
+        )
+        if os.environ.get("RRD_EXTERNAL_SANDBOX") != "1":
+            command.extend(["--sandbox", "read-only"])
+        command.extend(["--model", model])
         schema = _spec_output_schema(prompt) if stage in {"spec", "fallback_spec"} else None
         try:
             if schema is None:

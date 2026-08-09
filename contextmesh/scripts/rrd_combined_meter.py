@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evidence-correlated meter for the Codex ContextMesh + RRC paired demo."""
+"""Fail-closed native Codex meter for the paired ContextMesh/RRC demo."""
 
 from __future__ import annotations
 
@@ -9,581 +9,456 @@ import json
 import os
 import re
 import stat
-import sys
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-CM_ROOT = Path(__file__).resolve().parent.parent
-WIDTH = 104
-HANDLERS = {
-    "src/handlers/users.js",
-    "src/handlers/products.js",
-    "src/handlers/orders.js",
-    "src/handlers/reviews.js",
-}
+CM_ROOT = Path(__file__).resolve().parents[1]
+HANDLERS = {"orders", "products", "reviews", "users"}
 SHARED = {"src/models.js", "src/utils.js", "src/middleware.js"}
 WORKER_COUNT = 4
+MAX_META = 4096
+MAX_MANIFEST = 3_000_000
+MAX_JSONL = 50_000_000
 
 
 def _sha(value: bytes | str) -> str:
-    if isinstance(value, str):
-        value = value.encode()
-    return hashlib.sha256(value).hexdigest()
+    return hashlib.sha256(value.encode() if isinstance(value, str) else value).hexdigest()
 
 
-def _current_file_hash(root: Path, relative: str) -> str | None:
+def _read_regular(path: Path, limit: int, *, mode: int | None = None) -> bytes | None:
     try:
-        canonical_root = root.resolve(strict=True)
-        candidate = canonical_root
-        parts = Path(relative).parts
-        if not parts:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > limit
+            or (mode is not None and stat.S_IMODE(before.st_mode) != mode)
+        ):
             return None
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_size > limit
+                or (mode is not None and stat.S_IMODE(after.st_mode) != mode)
+            ):
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            while total <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+    raw = b"".join(chunks)
+    return raw if len(raw) <= limit else None
+
+
+def _object(path: Path, limit: int, *, mode: int | None = None) -> dict[str, object] | None:
+    raw = _read_regular(path, limit, mode=mode)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _jsonl(path: Path) -> tuple[list[dict[str, object]], bool]:
+    raw = _read_regular(path, MAX_JSONL)
+    if raw is None:
+        return [], False
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return [], False
+    rows: list[dict[str, object]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            return [], False
+        if not isinstance(row, dict):
+            return [], False
+        rows.append(row)
+    return rows, True
+
+
+def _current_hash(root: Path, relative: str) -> str | None:
+    parts = Path(relative).parts
+    if not parts or relative.startswith("/") or ".." in parts:
+        return None
+    try:
+        canonical = root.resolve(strict=True)
+        candidate = canonical
         for part in parts:
             candidate /= part
             metadata = os.lstat(candidate)
             if stat.S_ISLNK(metadata.st_mode):
                 return None
-        if not stat.S_ISREG(metadata.st_mode):
-            return None
-        candidate = candidate.resolve(strict=True)
-        candidate.relative_to(canonical_root)
-        descriptor = os.open(
-            candidate,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-        )
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                return None
-            digest = hashlib.sha256()
-            while True:
-                chunk = os.read(descriptor, 64 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        finally:
-            os.close(descriptor)
-    except (OSError, ValueError):
+        raw = _read_regular(candidate, 1_000_000)
+    except OSError:
         return None
-    return digest.hexdigest()
+    return _sha(raw) if raw is not None else None
 
 
-def _source_authority(
-    arm: Path,
-) -> tuple[dict[str, str], dict[str, tuple[str, str]], bool]:
+def _source_authority(arm: Path, backend: str) -> tuple[dict[str, str], dict[str, str], bool]:
+    manifest = _object(arm / "seed-manifest.json", MAX_MANIFEST, mode=0o600)
     target = arm / "target"
-    manifest_path = arm / "seed-manifest.json"
+    if manifest is None:
+        return {}, {}, False
+    unsigned = {key: value for key, value in manifest.items() if key != "seal"}
     try:
-        manifest = json.loads(manifest_path.read_text())
-        canonical_target = target.resolve(strict=True)
-        unsigned = {key: item for key, item in manifest.items() if key != "seal"}
-        seal = _sha(json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-        target_stat = canonical_target.stat()
-    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        canonical = target.resolve(strict=True)
+        metadata = canonical.stat()
+    except OSError:
         return {}, {}, False
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("v") != 1
-        or manifest.get("seal") != seal
-        or manifest.get("target_root") != str(canonical_target)
-        or manifest.get("target_device") != target_stat.st_dev
-        or manifest.get("target_inode") != target_stat.st_ino
+        manifest.get("v") != 1
+        or manifest.get("memory_backend") != backend
+        or manifest.get("target_root") != str(canonical)
+        or manifest.get("target_device") != metadata.st_dev
+        or manifest.get("target_inode") != metadata.st_ino
+        or manifest.get("seal")
+        != _sha(json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     ):
         return {}, {}, False
-    rows = manifest.get("files")
-    if not isinstance(rows, list) or len(rows) != len(SHARED):
+    handlers = {
+        name: _current_hash(canonical, f"src/handlers/{name}.js") or "" for name in HANDLERS
+    }
+    if not all(re.fullmatch(r"[a-f0-9]{64}", value) for value in handlers.values()):
         return {}, {}, False
-    shared_hashes: dict[str, tuple[str, str]] = {}
-    for row in rows:
+    shared: dict[str, str] = {}
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return {}, {}, False
+    for row in files:
         if not isinstance(row, dict):
             return {}, {}, False
-        path = row.get("path")
+        relative = row.get("path")
         raw_hash = row.get("raw_sha256")
         digest_hash = row.get("digest_sha256")
         if (
-            not isinstance(path, str)
-            or path not in SHARED
-            or path in shared_hashes
+            not isinstance(relative, str)
+            or relative not in SHARED
+            or row.get("memory_backend") != backend
             or not isinstance(raw_hash, str)
-            or len(raw_hash) != 64
             or not isinstance(digest_hash, str)
-            or len(digest_hash) != 64
-            or _current_file_hash(canonical_target, path) != raw_hash
+            or _current_hash(canonical, relative) != raw_hash
         ):
             return {}, {}, False
-        shared_hashes[path] = (raw_hash, digest_hash)
-    if set(shared_hashes) != SHARED:
-        return {}, {}, False
-    handler_hashes = {
-        path: value
-        for path in HANDLERS
-        if (value := _current_file_hash(canonical_target, path)) is not None
+        if backend == "sqlite":
+            digest = row.get("digest")
+            if not isinstance(digest, str) or _sha(digest) != digest_hash:
+                return {}, {}, False
+        shared[relative] = digest_hash
+    return handlers, shared, set(shared) == SHARED
+
+
+def _count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _usage(row: Mapping[str, object]) -> int | None:
+    input_tokens = _count(row.get("input_tokens"))
+    output_tokens = _count(row.get("output_tokens"))
+    total_tokens = _count(row.get("total_tokens"))
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        return None
+    if total_tokens != input_tokens + output_tokens:
+        return None
+    for name, maximum in (
+        ("cached_input_tokens", input_tokens),
+        ("cache_write_input_tokens", input_tokens),
+        ("reasoning_output_tokens", output_tokens),
+    ):
+        child = _count(row.get(name))
+        if child is None or child > maximum:
+            return None
+    return total_tokens
+
+
+def _planner_usage(rows: Sequence[Mapping[str, object]]) -> tuple[int, int, bool]:
+    success = [row for row in rows if row.get("parse_status") == "ok"]
+    total = 0
+    for row in success:
+        usage = row.get("usage")
+        if not isinstance(usage, dict):
+            return 0, len(success), False
+        prompt = _count(usage.get("prompt_tokens"))
+        completion = _count(usage.get("completion_tokens"))
+        combined = _count(usage.get("total_tokens"))
+        if prompt is None or completion is None or combined != prompt + completion:
+            return 0, len(success), False
+        assert combined is not None
+        total += combined
+    failed = any(row.get("parse_status") != "ok" for row in rows)
+    return total, len(success), not failed
+
+
+def _arm(round_dir: Path, side: str, backend: str) -> dict[str, int]:
+    arm = round_dir / side
+    handler_hashes, shared_hashes, sources_ok = _source_authority(arm, backend)
+    hooks, hooks_ok = _jsonl(arm / "hook-events.jsonl")
+    packets, packets_ok = _jsonl(arm / "rrc-events.jsonl")
+    model_rows, models_ok = _jsonl(arm / "rrc-model-events.jsonl")
+    evidence_ok = hooks_ok and packets_ok and models_ok
+    evidence_ok = evidence_ok and all(row.get("memory_backend") == backend for row in hooks)
+    evidence_ok = evidence_ok and all(row.get("memory_backend") == backend for row in packets)
+
+    assignments = [row for row in hooks if row.get("event") == "assignment"]
+    assigned_handlers = {
+        str(row.get("handler", "")).removeprefix("src/handlers/").removesuffix(".js")
+        for row in assignments
     }
-    return handler_hashes, shared_hashes, set(handler_hashes) == HANDLERS
-
-
-def _jsonl(path: Path) -> list[dict[str, object]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, object]] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return rows
-    for line in lines:
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
+    assignment_tools = {
+        row.get("tool_use_id")
+        for row in assignments
+        if isinstance(row.get("tool_use_id"), str)
+        and row.get("handler_sha256")
+        == handler_hashes.get(
+            str(row.get("handler", "")).removeprefix("src/handlers/").removesuffix(".js")
+        )
+    }
+    spawned_rows = [row for row in hooks if row.get("event") == "spawned"]
+    spawned = {
+        row.get("agent_id")
+        for row in spawned_rows
+        if isinstance(row.get("agent_id"), str) and row.get("tool_use_id") in assignment_tools
+    }
+    shared_rows = [row for row in hooks if row.get("event") == "shared_context"]
+    shared_agents: set[str] = set()
+    for row in shared_rows:
+        receipts = row.get("receipts")
+        if not isinstance(receipts, list):
             continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
-
-
-def _integer(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
-def _token_total(rows: Sequence[Mapping[str, object]]) -> int:
-    return sum(
-        _integer(row.get("input_tokens")) + _integer(row.get("output_tokens")) for row in rows
+        observed = {
+            receipt.get("path"): receipt.get("digest_sha256")
+            for receipt in receipts
+            if isinstance(receipt, dict)
+        }
+        if observed == shared_hashes and isinstance(row.get("agent_id"), str):
+            shared_agents.add(str(row["agent_id"]))
+    finals = {
+        row.get("agent_id")
+        for row in hooks
+        if row.get("event") == "result_final"
+        and isinstance(row.get("agent_id"), str)
+        and _count(row.get("delivered_chars")) is not None
+        and isinstance(row.get("delivered_sha256"), str)
+    }
+    waits = [row for row in hooks if row.get("event") == "wait_result"]
+    wait_completed: list[str] = []
+    waits_valid = bool(waits)
+    for row in waits:
+        completed = row.get("completed_agent_ids")
+        if (
+            not isinstance(completed, list)
+            or not all(isinstance(agent_id, str) for agent_id in completed)
+            or row.get("result_count") != len(completed)
+            or row.get("timed_out") is not False
+        ):
+            waits_valid = False
+            continue
+        wait_completed.extend(completed)
+    wait_ok = (
+        waits_valid
+        and len(wait_completed) == WORKER_COUNT
+        and len(set(wait_completed)) == WORKER_COUNT
+        and set(wait_completed) == spawned
+    )
+    compressed_agents: set[str] = set()
+    compression_rows = [row for row in hooks if row.get("event") == "compression_delivered"]
+    for row in compression_rows:
+        receipts = row.get("receipts")
+        if not isinstance(receipts, dict):
+            continue
+        if all(
+            isinstance(value, dict)
+            and re.fullmatch(r"[a-f0-9]{20}", str(value.get("receipt", "")))
+            and re.fullmatch(r"[a-f0-9]{64}", str(value.get("sha256", "")))
+            and (_count(value.get("bytes")) or 0) > 0
+            for value in receipts.values()
+        ):
+            compressed_agents.update(str(key) for key in receipts)
+    bypass_rows = [row for row in hooks if row.get("event") == "compression_bypass"]
+    bypassed_agents: set[str] = set()
+    for row in bypass_rows:
+        agents = row.get("agent_ids")
+        receipts = row.get("receipts")
+        if (
+            isinstance(agents, list)
+            and all(isinstance(agent_id, str) for agent_id in agents)
+            and isinstance(receipts, dict)
+            and set(agents) == set(receipts)
+            and (_count(row.get("raw_bytes")) or 0) > 0
+        ):
+            bypassed_agents.update(agents)
+    compression_ok = (compressed_agents | bypassed_agents) == spawned
+    root_merge = sum(
+        row.get("event") == "root_merge" and (_count(row.get("chars")) or 0) > 0 for row in hooks
     )
 
+    usage_rows = [row for row in hooks if row.get("event") == "native_usage"]
+    root_usage = [row for row in usage_rows if row.get("component") == "root"]
+    worker_usage = [row for row in usage_rows if row.get("component") == "worker"]
+    worker_usage_ids = {row.get("agent_id") for row in worker_usage}
+    native_values = [_usage(row) for row in [*root_usage, *worker_usage]]
+    usage_ok = (
+        len(root_usage) == 1
+        and len(worker_usage) == WORKER_COUNT
+        and worker_usage_ids == spawned
+        and len({row.get("session_id") for row in [*root_usage, *worker_usage]}) == WORKER_COUNT + 1
+        and all(value is not None for value in native_values)
+    )
+    native_tokens = sum(value or 0 for value in native_values)
 
-def _digest_saved(manifest_path: Path) -> int:
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return 0
-    total = 0
-    for row in manifest.get("files", []) if isinstance(manifest, dict) else []:
-        if not isinstance(row, dict):
-            continue
-        raw = _integer(row.get("raw_chars"))
-        digest = _integer(row.get("digest_chars"))
-        avoided_chars = max(0, raw - digest)
-        estimated_tokens_per_worker = (avoided_chars + 3) // 4
-        total += estimated_tokens_per_worker * WORKER_COUNT
-    return total
+    packet_rows = [row for row in packets if row.get("event") == "packet"]
+    misses = sum(row.get("branch") == "miss" for row in packet_rows)
+    hits = sum(row.get("branch") == "hit" for row in packet_rows)
+    expected = (WORKER_COUNT, 0) if side == "a" else (1, WORKER_COUNT - 1)
+    packet_handlers = {
+        str(row.get("handler", "")).removeprefix("src/handlers/").removesuffix(".js")
+        for row in packet_rows
+    }
+    packets_valid = (
+        len(packet_rows) == WORKER_COUNT
+        and packet_handlers == HANDLERS
+        and all(row.get("branch") in {"miss", "hit"} for row in packet_rows)
+        and (misses, hits) == expected
+    )
+    planner_tokens, planner_calls, planner_ok = _planner_usage(model_rows)
+    planner_ok = planner_ok and planner_calls == expected[0]
+    failures = sum(
+        row.get("event")
+        in {"fail_open", "policy_deny", "compress_fail_open", "native_usage_missing"}
+        for row in hooks
+    )
+    protocol_ok = (
+        len(assignments) == WORKER_COUNT
+        and assigned_handlers == HANDLERS
+        and len(assignment_tools) == WORKER_COUNT
+        and len(spawned) == WORKER_COUNT
+        and shared_agents == spawned
+        and finals == spawned
+        and wait_ok
+        and compression_ok
+        and root_merge == 1
+        and packets_valid
+    )
+    ready = int(
+        sources_ok and evidence_ok and protocol_ok and usage_ok and planner_ok and failures == 0
+    )
+    return {
+        "ready": ready,
+        "root_tokens": _usage(root_usage[0]) or 0 if len(root_usage) == 1 else 0,
+        "worker_tokens": sum(_usage(row) or 0 for row in worker_usage),
+        "planner_tokens": planner_tokens,
+        "combined_tokens": native_tokens + planner_tokens,
+        "workers": len(spawned),
+        "assignments": len(assignment_tools),
+        "shared_contexts": len(shared_agents),
+        "results": len(finals),
+        "compressions": len(compression_rows),
+        "misses": misses,
+        "hits": hits,
+        "planner_calls": planner_calls,
+        "source_state_ok": int(sources_ok),
+        "evidence_ok": int(evidence_ok),
+        "protocol_ok": int(protocol_ok),
+        "usage_ok": int(usage_ok),
+        "planner_ok": int(planner_ok),
+        "failures": failures,
+    }
 
 
-def collect(round_id: str, *, root: Path = CM_ROOT) -> dict[str, dict[str, int]]:
-    """Correlate tokens, assignments, agents, shared receipts, results, and merge."""
-
-    token_rows = _jsonl(root / "runs/rrd-tokens.jsonl")
-    snapshot: dict[str, dict[str, int]] = {}
-    setup_prefix = f"rrd-demo-{round_id}-setup-"
-    setup_rows = [
-        row
-        for row in token_rows
-        if isinstance(row.get("session"), str) and str(row["session"]).startswith(setup_prefix)
-    ]
-    setup_exact = [row for row in setup_rows if row.get("measurement_state") == "exact"]
-    setup_inexact = len(setup_rows) - len(setup_exact)
-    for side in ("a", "b"):
-        base = f"rrd-demo-{round_id}-{side}"
-        sessions = {
-            "outer": f"{base}-outer",
-            "summarizer": f"{base}-summarizer",
-            "planner": f"{base}-planner",
-        }
-        exact_by_kind: dict[str, list[dict[str, object]]] = {}
-        for kind, session in sessions.items():
-            exact_by_kind[kind] = [
-                row
-                for row in token_rows
-                if row.get("session") == session and row.get("measurement_state") == "exact"
-            ]
-        arm_prefixed = [
-            row
-            for row in token_rows
-            if isinstance(row.get("session"), str)
-            and str(row["session"]).startswith(base)
-            and not str(row["session"]).startswith(setup_prefix)
-        ]
-        allowed_sessions = set(sessions.values())
-        inexact = [
-            row
-            for row in arm_prefixed
-            if row.get("measurement_state") != "exact" or row.get("session") not in allowed_sessions
-        ]
-
-        arm = root / "runs/rrd-demo" / round_id / side
-        handler_hashes, shared_hashes, source_state_ok = _source_authority(arm)
-        hooks = _jsonl(arm / "hook-events.jsonl")
-        proxy = _jsonl(arm / "proxy-events.jsonl")
-        rrc = _jsonl(arm / "rrc-events.jsonl")
-        assignments = [row for row in hooks if row.get("event") == "assignment"]
-        assignment_ids = {
-            row.get("assignment_id")
-            for row in assignments
-            if isinstance(row.get("assignment_id"), str)
-        }
-        handlers = {
-            row.get("handler") for row in assignments if isinstance(row.get("handler"), str)
-        }
-        tool_ids = {
-            row.get("tool_use_id") for row in assignments if isinstance(row.get("tool_use_id"), str)
-        }
-        spawned = [row for row in hooks if row.get("event") == "spawned"]
-        agents = {row.get("agent_id") for row in spawned if isinstance(row.get("agent_id"), str)}
-        spawned_tool_ids = {
-            row.get("tool_use_id")
-            for row in spawned
-            if isinstance(row.get("tool_use_id"), str) and isinstance(row.get("agent_id"), str)
-        }
-        starts = [row for row in hooks if row.get("event") == "shared_context"]
-        start_agents = {
-            row.get("agent_id") for row in starts if isinstance(row.get("agent_id"), str)
-        }
-        receipt_agents: set[str] = set()
-        receipts_ok = True
-        for row in starts:
-            receipts = row.get("receipts")
-            paths: set[object] = set()
-            if isinstance(receipts, list) and len(receipts) == len(SHARED):
-                for receipt in receipts:
-                    if not isinstance(receipt, dict):
-                        continue
-                    path = receipt.get("path")
-                    expected_hashes = shared_hashes.get(path) if isinstance(path, str) else None
-                    if (
-                        expected_hashes is not None
-                        and receipt.get("hit") is True
-                        and receipt.get("raw_sha256") == expected_hashes[0]
-                        and receipt.get("digest_sha256") == expected_hashes[1]
-                    ):
-                        paths.add(path)
-            agent_id = row.get("agent_id")
-            if paths == SHARED and isinstance(agent_id, str):
-                receipt_agents.add(agent_id)
-            else:
-                receipts_ok = False
-        finals = [row for row in hooks if row.get("event") == "result_final"]
-        final_evidence = {
-            str(row["agent_id"]): (
-                _integer(row.get("delivered_chars")),
-                str(row["delivered_sha256"]),
-            )
-            for row in finals
-            if isinstance(row.get("agent_id"), str)
-            and _integer(row.get("delivered_chars")) > 0
-            and isinstance(row.get("delivered_sha256"), str)
-            and re.fullmatch(r"[a-f0-9]{64}", str(row["delivered_sha256"])) is not None
-        }
-        final_agents = set(final_evidence)
-        wait_agents: set[str] = set()
-        wait_evidence: dict[str, tuple[int, str]] = {}
-        wait_rows = [row for row in hooks if row.get("event") == "wait_result"]
-        waits_ok = bool(wait_rows)
-        for row in wait_rows:
-            agent_ids = row.get("agent_ids")
-            completed_ids = row.get("completed_agent_ids")
-            valid_agents = (
-                {item for item in agent_ids if isinstance(item, str)}
-                if isinstance(agent_ids, list)
-                else set()
-            )
-            valid_completed = (
-                {item for item in completed_ids if isinstance(item, str)}
-                if isinstance(completed_ids, list)
-                else set()
-            )
-            completed_results = row.get("completed_results")
-            valid_results: dict[str, tuple[int, str]] = {}
-            if isinstance(completed_results, dict):
-                for agent_id, result in completed_results.items():
-                    if (
-                        isinstance(agent_id, str)
-                        and isinstance(result, dict)
-                        and _integer(result.get("chars")) > 0
-                        and isinstance(result.get("sha256"), str)
-                        and re.fullmatch(r"[a-f0-9]{64}", str(result["sha256"])) is not None
-                    ):
-                        valid_results[agent_id] = (
-                            _integer(result["chars"]),
-                            str(result["sha256"]),
-                        )
-            row_ok = (
-                row.get("timed_out") is False
-                and bool(valid_agents)
-                and valid_agents == valid_completed
-                and valid_agents == set(valid_results)
-                and _integer(row.get("result_count")) == len(valid_results)
-                and not any(
-                    agent_id in wait_evidence and wait_evidence[agent_id] != evidence
-                    for agent_id, evidence in valid_results.items()
-                )
-            )
-            waits_ok = waits_ok and row_ok
-            if row_ok:
-                wait_agents.update(valid_completed)
-                wait_evidence.update(valid_results)
-        start_times: dict[str, float] = {}
-        for row in starts:
-            agent_id, timestamp = row.get("agent_id"), row.get("ts")
-            if isinstance(agent_id, str) and isinstance(timestamp, (int, float)):
-                start_times[agent_id] = float(timestamp)
-        stop_times: dict[str, float] = {}
-        for row in finals:
-            agent_id, timestamp = row.get("agent_id"), row.get("ts")
-            if isinstance(agent_id, str) and isinstance(timestamp, (int, float)):
-                stop_times[agent_id] = float(timestamp)
-        overlap = int(
-            len(start_times) == 4
-            and len(stop_times) == 4
-            and max(start_times.values()) < min(stop_times.values())
-        )
-        packets = [row for row in rrc if row.get("event") == "packet"]
-        misses = sum(row.get("branch") == "miss" for row in packets)
-        hits = sum(row.get("branch") == "hit" for row in packets)
-        control_rows = [row for row in hooks if row.get("branch") == "control"]
-        controls = len(control_rows)
-        packet_rows = packets if packets else control_rows
-        packet_ids = {
-            row.get("task_id", row.get("assignment_id"))
-            for row in packet_rows
-            if isinstance(row.get("task_id", row.get("assignment_id")), str)
-        }
-        packet_handlers = {
-            row.get("handler") for row in packet_rows if isinstance(row.get("handler"), str)
-        }
-        fail_open = sum(
-            row.get("event") in {"fail_open", "policy_deny", "compress_fail_open"}
-            for row in [*hooks, *rrc, *proxy]
-        )
-        proxy_receipts = {
-            row.get("receipt")
-            for row in proxy
-            if row.get("event") == "result_compress"
-            and isinstance(row.get("receipt"), str)
-            and re.fullmatch(r"[a-f0-9]{20}", str(row["receipt"])) is not None
-        }
-        final_receipts = {
-            row.get("compression_receipt")
-            for row in finals
-            if isinstance(row.get("compression_receipt"), str)
-            and re.fullmatch(r"[a-f0-9]{20}", str(row["compression_receipt"])) is not None
-        }
-        compressions = len(proxy_receipts & final_receipts)
-        root_merges = sum(
-            row.get("event") == "root_merge"
-            and _integer(row.get("chars")) > 0
-            and isinstance(row.get("sha256"), str)
-            and re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"])) is not None
-            for row in hooks
-        )
-        expected = (4, 0) if side == "a" else (1, 3)
-        rrc_ok = (misses, hits) == expected or controls == 4
-        correlated = (
-            len(assignments) == 4
-            and len(assignment_ids) == 4
-            and len(tool_ids) == 4
-            and all(
-                isinstance(row.get("handler_sha256"), str)
-                and isinstance(row.get("handler"), str)
-                and handler_hashes.get(str(row["handler"])) == row["handler_sha256"]
-                for row in assignments
-            )
-            and handlers == HANDLERS
-            and source_state_ok
-            and len(spawned) == 4
-            and len(agents) == 4
-            and spawned_tool_ids == tool_ids
-            and len(starts) == 4
-            and len(finals) == 4
-            and agents == start_agents == receipt_agents == final_agents
-            and wait_agents == agents
-            and wait_evidence == final_evidence
-            and waits_ok
-            and receipts_ok
-            and packet_ids == assignment_ids
-            and packet_handlers == HANDLERS
-        )
-        outer = _token_total(exact_by_kind["outer"])
-        summarizer = _token_total(exact_by_kind["summarizer"])
-        planner = _token_total(exact_by_kind["planner"])
-        ready = int(
-            bool(exact_by_kind["outer"])
-            and bool(exact_by_kind["summarizer"])
-            and (bool(exact_by_kind["planner"]) or controls == 4)
-            and setup_inexact == 0
-            and not inexact
-            and correlated
-            and overlap == 1
-            and rrc_ok
-            and fail_open == 0
-            and root_merges == 1
-            and compressions >= 1
-        )
-        snapshot[side] = {
-            "outer_tokens": outer,
-            "summarizer_tokens": summarizer,
-            "planner_tokens": planner,
-            "combined_tokens": outer + summarizer + planner,
-            "setup_tokens": _token_total(setup_exact),
-            "setup_inexact_records": setup_inexact,
-            "requests": sum(len(rows) for rows in exact_by_kind.values()),
-            "outer_records": len(exact_by_kind["outer"]),
-            "summarizer_records": len(exact_by_kind["summarizer"]),
-            "planner_records": len(exact_by_kind["planner"]),
-            "workers": len(agents),
-            "assignments": len(assignment_ids),
-            "handler_set_ok": int(handlers == HANDLERS),
-            "source_state_ok": int(source_state_ok),
-            "packets": len(packets) if packets else controls,
-            "misses": misses,
-            "hits": hits,
-            "controls": controls,
-            "fail_open": fail_open,
-            "digest_worker_sessions": len(receipt_agents),
-            "digest_saved": _digest_saved(arm / "seed-manifest.json"),
-            "task_compressed": compressions,
-            "results": len(final_agents & wait_agents),
-            "root_merges": root_merges,
-            "overlap": overlap,
-            "inexact_records": len(inexact),
-            "ready": ready,
-        }
+def collect(
+    round_id: str, *, memory_backend: str | None = None, root: Path = CM_ROOT
+) -> dict[str, dict[str, int]]:
+    round_dir = root / "runs" / "rrd-demo" / round_id
+    meta = _object(round_dir / "round-meta.json", MAX_META, mode=0o600)
+    backend = memory_backend or (str(meta.get("memory_backend")) if meta else "")
+    meta_ok = bool(
+        meta
+        and meta.get("v") == 2
+        and meta.get("round_id") == round_id
+        and meta.get("memory_backend") == backend
+        and meta.get("provider") == "native-codex"
+        and isinstance(meta.get("model"), str)
+        and round_id.startswith(f"rrd-{backend}-")
+    )
+    snapshot = {side: _arm(round_dir, side, backend) for side in ("a", "b")}
+    if not meta_ok:
+        for side in snapshot.values():
+            side["ready"] = 0
+            side["evidence_ok"] = 0
     return snapshot
 
 
-def _box(line: str = "") -> str:
-    return "│ " + line[: WIDTH - 4].ljust(WIDTH - 4) + " │"
-
-
-def _value(side: Mapping[str, int], key: str) -> int:
-    return int(side.get(key, 0))
-
-
-def render(round_id: str, snapshot: Mapping[str, Mapping[str, int]]) -> str:
-    cold, warm = snapshot.get("a", {}), snapshot.get("b", {})
-    ready = bool(_value(cold, "ready") and _value(warm, "ready"))
-    delta = _value(cold, "combined_tokens") - _value(warm, "combined_tokens")
-    title = f" Codex ContextMesh + ReasonRenderCoding paired meter — {round_id} "
-    rows = (
-        ("", "COLD + CM (a)", "WARM + CM (b)"),
-        (
-            "Codex outer (root+workers)",
-            f"{_value(cold, 'outer_tokens'):,}",
-            f"{_value(warm, 'outer_tokens'):,}",
-        ),
-        (
-            "ContextMesh summarizer",
-            f"{_value(cold, 'summarizer_tokens'):,}",
-            f"{_value(warm, 'summarizer_tokens'):,}",
-        ),
-        (
-            "RRC planner",
-            f"{_value(cold, 'planner_tokens'):,}",
-            f"{_value(warm, 'planner_tokens'):,}",
-        ),
-        (
-            "STEADY TOTAL",
-            f"{_value(cold, 'combined_tokens'):,}",
-            f"{_value(warm, 'combined_tokens'):,}",
-        ),
-        (
-            "workers / assignments / results",
-            f"{_value(cold, 'workers')}/4 · {_value(cold, 'assignments')}/4 · {_value(cold, 'results')}/4",
-            f"{_value(warm, 'workers')}/4 · {_value(warm, 'assignments')}/4 · {_value(warm, 'results')}/4",
-        ),
-        (
-            "RRC packets",
-            f"{_value(cold, 'misses')} MISS / {_value(cold, 'hits')} HIT",
-            f"{_value(warm, 'misses')} MISS / {_value(warm, 'hits')} HIT",
-        ),
-        (
-            "CM digest delivery",
-            f"{_value(cold, 'digest_worker_sessions')}/4",
-            f"{_value(warm, 'digest_worker_sessions')}/4",
-        ),
-        (
-            "compressed results / overlap / merge",
-            f"{_value(cold, 'task_compressed')} · {_value(cold, 'overlap')} · {_value(cold, 'root_merges')}",
-            f"{_value(warm, 'task_compressed')} · {_value(warm, 'overlap')} · {_value(warm, 'root_merges')}",
-        ),
-    )
-    lines = ["┌" + title.center(WIDTH - 2, "─") + "┐"]
-    if ready:
-        lines.append(
-            _box(
-                f"▶ READY · PAIRED SAMPLE · WARM steady-state delta: {delta:,} tokens (not a causal estimate)"
-            )
-        )
-    else:
-        lines.append(_box("▶ NOT READY · INCOMPLETE — no comparison claim"))
-    lines.append("├" + "─" * (WIDTH - 2) + "┤")
-    for label, left, right in rows:
-        lines.append(_box(f"{label:<34}{left:>30}{right:>34}"))
-    lines.append(_box())
-    lines.append(
-        _box(f"Setup/seed tokens (excluded from steady totals): {_value(cold, 'setup_tokens'):,}")
-    )
-    lines.append(
-        _box(
-            "ContextMesh digest savings are counterfactual estimates, never subtracted from actual totals."
-        )
-    )
-    lines.append(
-        _box(
-            "Estimated digest tokens avoided across 4 workers: "
-            f"a={_value(cold, 'digest_saved'):,} · b={_value(warm, 'digest_saved'):,}"
-        )
-    )
-    lines.append(
-        _box(
-            f"Fail-open/policy events: a={_value(cold, 'fail_open')} · b={_value(warm, 'fail_open')}"
-        )
-    )
+def render(
+    round_id: str, snapshot: Mapping[str, Mapping[str, int]], memory_backend: str | None = None
+) -> str:
+    a, b = snapshot.get("a", {}), snapshot.get("b", {})
+    ready = bool(a.get("ready") and b.get("ready"))
+    delta = int(a.get("combined_tokens", 0)) - int(b.get("combined_tokens", 0))
+    percent = 100 * delta / int(a.get("combined_tokens", 0)) if a.get("combined_tokens") else 0
+    state = "READY" if ready else "NOT READY"
+    lines = [
+        f"ContextMesh + ReasonRenderCoding native Codex meter — {round_id}",
+        f"state: {state} · memory={memory_backend or 'unknown'} · observational usage only",
+        "",
+        f"{'':24} {'COLD (a)':>14} {'WARM (b)':>14}",
+        f"{'root tokens':24} {int(a.get('root_tokens', 0)):>14,} {int(b.get('root_tokens', 0)):>14,}",
+        f"{'worker tokens':24} {int(a.get('worker_tokens', 0)):>14,} {int(b.get('worker_tokens', 0)):>14,}",
+        f"{'RRC planner tokens':24} {int(a.get('planner_tokens', 0)):>14,} {int(b.get('planner_tokens', 0)):>14,}",
+        f"{'TOTAL provider-visible':24} {int(a.get('combined_tokens', 0)):>14,} {int(b.get('combined_tokens', 0)):>14,}",
+        f"{'workers':24} {int(a.get('workers', 0)):>13}/4 {int(b.get('workers', 0)):>13}/4",
+        f"{'RRC MISS / HIT':24} {int(a.get('misses', 0)):>6} / {int(a.get('hits', 0)):<6} {int(b.get('misses', 0)):>6} / {int(b.get('hits', 0)):<6}",
+        f"{'compression deliveries':24} {int(a.get('compressions', 0)):>14} {int(b.get('compressions', 0)):>14}",
+        "",
+        f"observed WARM delta: {delta:,} tokens ({percent:.1f}% vs COLD)",
+        "billing_exact=false · hidden_retry_observable=false · cached input is not subtracted",
+    ]
     if not ready:
-        lines.append(_box(f"Readiness: a={_reason(cold, 'a')} · b={_reason(warm, 'b')}"))
-    lines.append("└" + "─" * (WIDTH - 2) + "┘")
-    return "\n".join(lines)
-
-
-def _reason(side: Mapping[str, int], label: str) -> str:
-    reasons: list[str] = []
-    if _value(side, "requests") == 0:
-        reasons.append("no exact traffic")
-    elif not _value(side, "outer_records"):
-        reasons.append("no outer traffic")
-    if not _value(side, "summarizer_records"):
-        reasons.append("no summarizer traffic")
-    if not _value(side, "planner_records") and _value(side, "controls") != 4:
-        reasons.append("no planner traffic")
-    if _value(side, "inexact_records"):
-        reasons.append("inexact/foreign traffic")
-    if _value(side, "setup_inexact_records"):
-        reasons.append("inexact setup traffic")
-    if _value(side, "workers") != 4:
-        reasons.append(f"workers {_value(side, 'workers')}/4")
-    if _value(side, "assignments") != 4 or not _value(side, "handler_set_ok"):
-        reasons.append("assignments/handlers")
-    if not _value(side, "source_state_ok"):
-        reasons.append("current source/manifest hashes")
-    if _value(side, "digest_worker_sessions") != 4:
-        reasons.append("digest receipts")
-    if _value(side, "results") != 4:
-        reasons.append("results")
-    expected = (4, 0) if label == "a" else (1, 3)
-    if (_value(side, "misses"), _value(side, "hits")) != expected and _value(side, "controls") != 4:
-        reasons.append("RRC branches")
-    if not _value(side, "overlap"):
-        reasons.append("no four-worker overlap")
-    if _value(side, "task_compressed") < 1:
-        reasons.append("no result compression")
-    if _value(side, "root_merges") != 1:
-        reasons.append("root merge")
-    if _value(side, "fail_open"):
-        reasons.append(f"fail-open {_value(side, 'fail_open')}")
-    return ", ".join(reasons) or "incomplete"
+        for label, side in (("a", a), ("b", b)):
+            bad = [
+                name.removesuffix("_ok")
+                for name in (
+                    "source_state_ok",
+                    "evidence_ok",
+                    "protocol_ok",
+                    "usage_ok",
+                    "planner_ok",
+                )
+                if not side.get(name)
+            ]
+            if side.get("failures"):
+                bad.append(f"{side['failures']} fail-open/policy events")
+            lines.append(f"{label}: " + (", ".join(bad) or "incomplete"))
+    width = max(len(line) for line in lines) + 2
+    return "\n".join(
+        ["┌" + "─" * width + "┐"]
+        + ["│ " + line.ljust(width - 1) + "│" for line in lines]
+        + ["└" + "─" * width + "┘"]
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--round", required=True)
+    parser.add_argument("--memory-backend", choices=("everos", "sqlite"), required=True)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--once", action="store_true")
     return parser
@@ -592,15 +467,16 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     while True:
-        output = render(args.round, collect(args.round))
-        print(("\033[2J\033[H" if args.watch else "") + output, flush=True)
+        snapshot = collect(args.round, memory_backend=args.memory_backend)
+        print(
+            ("\033[2J\033[H" if args.watch else "")
+            + render(args.round, snapshot, args.memory_backend),
+            flush=True,
+        )
         if not args.watch or args.once:
             return 0
-        try:
-            time.sleep(2)
-        except KeyboardInterrupt:
-            return 0
+        time.sleep(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

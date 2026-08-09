@@ -6,6 +6,8 @@ runs/
 
 # EverOS memory root — runtime data + machine-generated config (everos init regenerates it)
 everos-root/
+everos-native-root/
+.codex-rrd-native/
 
 # stray plugin metrics written when CONTEXTMESH_LOG is unset
 .contextmesh-metrics.jsonl

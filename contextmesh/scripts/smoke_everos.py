@@ -8,7 +8,7 @@ Proves the production properties ContextMesh depends on:
   3. re-POSTing the same key does not corrupt the stored value
   4. a fresh key misses cleanly (empty unprocessed_messages)
 
-Exits non-zero on any failure. Usage: python3 smoke_everos.py [base_url]
+Exits non-zero on any failure. Usage: python3 smoke_everos.py [service_url]
 """
 
 import hashlib
@@ -82,7 +82,9 @@ def main() -> int:
 
     status = put(key, payload)
     if status != "accumulated":
-        failures.append(f"write status was {status!r}, expected 'accumulated' (buffer was NOT parked!)")
+        failures.append(
+            f"write status was {status!r}, expected 'accumulated' (buffer was NOT parked!)"
+        )
 
     got = get(key)
     if got != payload:
