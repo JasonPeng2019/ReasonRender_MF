@@ -1,5 +1,10 @@
 # PLAN — Codex + Ollama ContextMesh/ReasonRenderCoding demo hardening
 
+> **Historical / non-RRCv2 / superseded.** This experiment record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. Ollama, OpenCode, Tollgate, and audit-packet routes below are
+> fixture-only/non-product.
+
 > Written with `/plan` on 2026-08-07 and revised after the installed-Codex M0
 > traces on 2026-08-08. This supersedes the OpenCode runtime design in
 > `docs/rfc-contextmesh-rrc-multiagent-demo.md` only for `RRDdemo.sh`.

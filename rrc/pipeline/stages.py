@@ -24,7 +24,6 @@ _SLOTS_KEYS = {
     "fields",
     "constants",
     "edge_values",
-    "values",
 }
 _CATEGORIES = ("identifiers", "types", "fields", "constants", "edge_values")
 
@@ -41,7 +40,7 @@ def _strict_strings(value: object, *, strip: bool = False) -> tuple[str, ...] | 
     return strings
 
 
-def parse_spec(raw: str, task: Task) -> Spec | None:
+def parse_spec(raw: str, task: Task, *, strict_primary: bool = True) -> Spec | None:
     """Parse the exact SPEC schema and validate it against task markers."""
 
     try:
@@ -80,28 +79,28 @@ def parse_spec(raw: str, task: Task) -> Spec | None:
         if parsed is None:
             return None
         categories[name] = parsed
-    values_value = slots_obj["values"]
-    if not isinstance(values_value, dict) or any(
-        not isinstance(key, str) or not isinstance(item, str) for key, item in values_value.items()
-    ):
+    try:
+        specification = Spec(
+            plan=plan.strip(),
+            signature=signature.strip(),
+            contract=contract.strip(),
+            tests=tests,
+            slots=Slots(
+                entity=cast(str | None, entity),
+                identifiers=categories["identifiers"],
+                types=categories["types"],
+                fields=categories["fields"],
+                constants=categories["constants"],
+                edge_values=categories["edge_values"],
+            ),
+        )
+    except (TypeError, ValueError):
         return None
-    concrete = {key: cast(str, item) for key, item in values_value.items()}
-    specification = Spec(
-        plan=plan.strip(),
-        signature=signature.strip(),
-        contract=contract.strip(),
-        tests=tests,
-        slots=Slots(
-            entity=cast(str | None, entity),
-            identifiers=categories["identifiers"],
-            types=categories["types"],
-            fields=categories["fields"],
-            constants=categories["constants"],
-            edge_values=categories["edge_values"],
-            values=dict(concrete),
-        ),
+    return (
+        specification
+        if validate_spec_for_task(specification, task, strict_primary=strict_primary)
+        else None
     )
-    return specification if validate_spec_for_task(specification, task) else None
 
 
 def _complete(

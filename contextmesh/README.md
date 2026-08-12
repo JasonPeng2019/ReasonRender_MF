@@ -3,7 +3,8 @@
 This demo runs the installed **Codex CLI** with its normal OpenAI authentication. It does not use a
 custom model provider, compatibility endpoint, bearer-key environment variable, or model-traffic
 proxy. ContextMesh supplies sealed shared-source context and compresses oversized native
-`wait_agent` results; ReasonRenderCoding supplies a validated per-worker audit packet.
+`wait_agent` results. ReasonRenderCoding performs the canonical SPEC → IMPLEMENT → deterministic
+VERIFY pipeline, including two repairs and one fallback after exhaustion.
 
 ## Product shape
 
@@ -15,13 +16,15 @@ proxy. ContextMesh supplies sealed shared-source context and compresses oversize
 - `RRDdemo.sh` is an alias for the EverOS variant.
 - `demo.sh` is a compatibility redirect to the local native-Codex variant.
 
-Both variants use the same installed Codex version, model, prompt, four-worker collaboration flow,
-hook implementation, and strict final-report grammar. Only the memory backend differs.
+Both variants use the same installed Codex version, generated coding assignment, one-worker
+collaboration flow, hook implementation, and receipt-only result transport. The coordinating root
+and strong SPEC/fallback stages use `gpt-5.5`/medium; source-blind IMPLEMENT workers use
+`gpt-5.6-luna`/low. Only the memory backend differs between launchers.
 
 ## Prerequisites and login
 
 - Codex CLI `0.147.0`
-- model `gpt-5.5` available to the signed-in account
+- models `gpt-5.5` and `gpt-5.6-luna` available to the signed-in account
 - Python 3.11+ and `uv`
 - `git`; Docker is optional for EverOS because the launcher can use the checked-out EverOS project
 
@@ -36,8 +39,8 @@ cd contextmesh
 ```
 
 `RRD_CODEX_BIN` may point to an absolute Codex executable. `RRD_CODEX_MODEL` and
-`RRD_CODEX_REASONING` are optional nonsecret settings; see `env.example`. Launchers deliberately do
-not source `.env.local`.
+`RRD_CODEX_REASONING`, `RRD_WORKER_MODEL`, and `RRD_WORKER_REASONING` are optional nonsecret
+settings; see `env.example`. Launchers deliberately do not source `.env.local`.
 
 ## Run the local variant
 
@@ -67,9 +70,10 @@ cd contextmesh
 ./RRDdemo-everos.sh down
 ```
 
-`prep` creates a backend-bound round, copies the benchmark target, deterministically seeds three
-shared-file digests for each arm, and copies the exact audit prompt. Paste that prompt into both
-TUIs. Side A is RRC COLD (four misses); side B is RRC WARM (one miss and three exact case hits).
+`prep` creates a backend-bound round and copies the benchmark target. Each side launcher generates
+one strict source-referencing `CodingAssignmentV1`, submits the bound prompt directly to the
+TUI, and records the exact prompt under the arm directory. Do not paste the historical audit prompt.
+Side A is RRC COLD; side B is RRC WARM over the same round database.
 For reproducible noninteractive testing, `run-a` and `run-b` execute the same arms through
 `codex exec --json` and save the root event stream in the corresponding arm directory.
 
@@ -77,18 +81,24 @@ EverOS 1.2.3 eagerly constructs an LLM client at startup even for storage-only t
 launcher supplies a public sentinel credential pointed at a closed loopback port; the demo's
 assistant-only writes and keyword reads make no external model or embedding request.
 
-Each root must launch exactly four native workers in parallel, one for each file under
-`src/handlers/`. A PreToolUse hook validates the assignment and attaches the handler plus RRC packet.
-A SubagentStart hook attaches the sealed digest and exact current bytes for `src/models.js`,
-`src/utils.js`, and `src/middleware.js`. A PostToolUse hook stores full completed reports as mode-0600
-receipts and can replace a large wait result with a deterministic summary below both 2,000 UTF-8
-bytes and 65% of the canonical raw response. Any compression error fails open and makes the meter
-NOT READY.
+Each root launches exactly one source-blind native worker for the one root-bound product task. The hook
+confines and seals the starter/public/oracle inputs, invokes canonical `prepare` once, and gives the
+worker only the rendered Spec, public-test digest, attempt ID, and output contract. It forces
+`fork_context=false`; the worker may not read source or call tools. `SubagentStop` persists the
+native transcript/usage attestation and candidate, while a durable finisher runs verification,
+repairs, fallback, and accept-before-store. `wait_agent` always substitutes a bounded pending,
+accepted, rejected, or operational-fallback envelope for an RRC target; it never exposes the
+unverified native candidate. The root applies an accepted receipt only through
+`rrd_result_reader.py`, which performs confined preimage CAS and atomic installation.
+
+The older four-handler audit experiment remains in `demo-prompt.txt` for historical reproduction.
+It is a generic ContextMesh experiment and is not called RRCv2.
 
 ## Measurement
 
 The meter reports native Codex provider-visible token usage from root, worker, and RRC planner
-evidence. It never presents those values as exact billed consumption because the stock CLI does not
+evidence and requires the durable cell-root `CostEventV1` plus `CombinedSessionRecordV1` union. It
+never presents those values as exact billed consumption because the stock CLI does not
 expose internal retry accounting. A comparison is valid only when all expected workers, source
 hashes, backend identities, RRC branches, wait receipts, final merge, and usage records correlate.
 Missing or malformed evidence is `NOT READY`; it is never converted to zero.
@@ -111,6 +121,20 @@ Latin-square order. It has no token watchdog, per-cell token ceiling, or aggrega
 or timed-out evidence is preserved rather than converted to zero. Interrupted source-identical runs
 can be continued with `--run-dir <path> --resume`. Raw artifacts remain under ignored
 `contextmesh/runs/`; only the concise result report is intended for Git.
+
+The newer hierarchical 2x2 ablation first compares four live-planner cells with four zero-token
+`RRC_CONTROL=deterministic` cells. It then freezes the selected RRC mode and runs four randomized,
+position-balanced replicates of `native`, `rrc`, `contextmesh`, and `combined` at 1, 2, and 4 workers
+(48 product cells). It separately reports total provider-visible, uncached input, cached input,
+output/reasoning, per-role token splits, frozen API-equivalent cost estimates, lexical quality, and
+blind model-adjudicated semantic quality. Judge usage is evaluation overhead and is excluded from
+product totals.
+
+```bash
+python3 contextmesh/bench/run_bench.py --run-ablation
+# resume only logical attempts that never started; physical attempts are immutable
+python3 contextmesh/bench/run_bench.py --run-ablation --run-dir <path> --resume
+```
 
 ## Deterministic verification
 

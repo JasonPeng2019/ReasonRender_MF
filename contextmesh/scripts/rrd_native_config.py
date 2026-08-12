@@ -17,6 +17,8 @@ from pathlib import Path
 
 CLI_VERSION = "codex-cli 0.147.0"
 DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_WORKER_MODEL = "gpt-5.6-luna"
+DEFAULT_WORKER_REASONING = "low"
 SANDBOX_PROFILE = "credential-deny.sb"
 DISABLED_FEATURES = (
     "apps",
@@ -63,9 +65,19 @@ def stable_home(root: Path) -> Path:
     return root / ".codex-rrd-native"
 
 
-def config_text(*, model: str, reasoning: str = "medium") -> str:
+def config_text(
+    *,
+    model: str,
+    reasoning: str = "medium",
+    worker_model: str = DEFAULT_WORKER_MODEL,
+    worker_reasoning: str = DEFAULT_WORKER_REASONING,
+) -> str:
     if reasoning not in {"low", "medium", "high", "xhigh"}:
         raise ConfigError("RRD_CODEX_REASONING must be low, medium, high, or xhigh")
+    if worker_reasoning not in {"none", "low", "medium", "high", "xhigh"}:
+        raise ConfigError("worker reasoning must be none, low, medium, high, or xhigh")
+    if not worker_model.strip():
+        raise ConfigError("worker model must not be empty")
     features = "\n".join(f"{name} = false" for name in DISABLED_FEATURES)
     return f"""model = {_quote(model)}
 model_reasoning_effort = {_quote(reasoning)}
@@ -88,9 +100,11 @@ multi_agent_v2 = false
 
 [agents]
 max_concurrent_threads_per_session = 4
+default_subagent_model = {_quote(worker_model)}
+default_subagent_reasoning_effort = {_quote(worker_reasoning)}
 
 [agents.worker]
-description = "Audit exactly one HTTP handler using sealed RRC and ContextMesh context."
+description = "Execute exactly one source-blind ReasonRenderCoding IMPLEMENT assignment. Use only the canonical Spec and public-test digest supplied by the controller, return the exact WorkerCandidateV1 JSON object, and do not call tools or read repository files."
 
 [shell_environment_policy]
 inherit = "none"
@@ -160,6 +174,8 @@ def write_home(
     python_bin: Path,
     hook_path: Path,
     reasoning: str = "medium",
+    worker_model: str = DEFAULT_WORKER_MODEL,
+    worker_reasoning: str = DEFAULT_WORKER_REASONING,
     user_home: Path | None = None,
     repo_root: Path | None = None,
 ) -> None:
@@ -168,7 +184,15 @@ def write_home(
     config = home / "config.toml"
     hooks = home / "hooks.json"
     profile = home / SANDBOX_PROFILE
-    config.write_text(config_text(model=model, reasoning=reasoning), encoding="utf-8")
+    config.write_text(
+        config_text(
+            model=model,
+            reasoning=reasoning,
+            worker_model=worker_model,
+            worker_reasoning=worker_reasoning,
+        ),
+        encoding="utf-8",
+    )
     hooks.write_text(
         json.dumps(
             hooks_value(python_bin=python_bin, hook_path=hook_path),
@@ -278,6 +302,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-bin")
     parser.add_argument("--model", default=os.environ.get("RRD_CODEX_MODEL", DEFAULT_MODEL))
     parser.add_argument("--reasoning", default=os.environ.get("RRD_CODEX_REASONING", "medium"))
+    parser.add_argument(
+        "--worker-model", default=os.environ.get("RRD_WORKER_MODEL", DEFAULT_WORKER_MODEL)
+    )
+    parser.add_argument(
+        "--worker-reasoning",
+        default=os.environ.get("RRD_WORKER_REASONING", DEFAULT_WORKER_REASONING),
+    )
     parser.add_argument("--no-login", action="store_true")
     return parser
 
@@ -296,6 +327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             python_bin=python_bin,
             hook_path=hook_path,
             reasoning=args.reasoning,
+            worker_model=args.worker_model,
+            worker_reasoning=args.worker_reasoning,
             repo_root=root.parent,
         )
     if args.command == "check":

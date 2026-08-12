@@ -7,7 +7,7 @@ from rrc.contract import (
     Solver,
     StoreFailure,
 )
-from rrc.pipeline import solve
+from rrc.pipeline.solve import solve
 
 from tests.pipeline.helpers import make_task
 
@@ -15,7 +15,7 @@ from tests.pipeline.helpers import make_task
 def test_public_solver_has_the_frozen_callable_seam() -> None:
     solver: Solver = solve
     assert callable(solver)
-    assert Config().repair_cap_N == 1
+    assert Config("owner").repair_cap_N == 2
 
 
 def test_store_failure_retains_completed_outcome() -> None:
@@ -30,6 +30,7 @@ def test_store_failure_retains_completed_outcome() -> None:
         escalated=False,
         template=None,
         cost_events=(),
+        oracle_status="passed",
     )
     failure = StoreFailure(outcome)
     assert failure.outcome is outcome
@@ -37,7 +38,7 @@ def test_store_failure_retains_completed_outcome() -> None:
 
 def test_null_retrieval_is_a_typed_no_op() -> None:
     retrieval = NullRetrieval()
-    assert retrieval.retrieve(make_task(), Config()) == []
+    assert retrieval.retrieve(make_task(), Config("owner")) == []
     assert retrieval.get_template("missing") is None
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from rrc.contract import Slots, Spec, Task
+from rrc.contract import Slots, Spec, StructuralShapeV1, Task
 
 
 def make_task(
@@ -30,7 +30,12 @@ def make_task(
             f"Implement {function} for {entity}; accept {field}: {arg_type} and return it.\n"
             f"RRC_SHAPE: {shape}\nRRC_SLOT_VALUES: {values}"
         ),
-        oracle_tests=oracle_tests,
+        oracle_tests=() if oracle_tests is None else (oracle_tests,),
+        family="lookup",
+        verification_profile="rrcv2_synthetic_v1",
+        primary=function,
+        shape=StructuralShapeV1((arg_type,), 1, (field,)),
+        slot_values=(("entity", entity), ("field", field), ("function", function)),
     )
 
 
@@ -50,7 +55,6 @@ def make_spec(
             entity=entity,
             identifiers=(function,),
             fields=(field,),
-            values={"entity": entity, "function": function, "field": field},
         ),
     )
 
@@ -71,7 +75,6 @@ def spec_json(**overrides: object) -> str:
                 "fields": list(slots.fields),
                 "constants": list(slots.constants),
                 "edge_values": list(slots.edge_values),
-                "values": dict(slots.values),
             },
         },
         separators=(",", ":"),

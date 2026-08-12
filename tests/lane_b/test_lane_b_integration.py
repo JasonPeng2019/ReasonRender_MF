@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-from rrc.contract import Config
+import pytest
+from rrc.contract import ModelRole, RunContext, Slots, Spec
 from rrc.everos import EverOSClient
-from rrc.memory import EverOSRetrieval, task_case_shape
-from rrc.model import parse_codex_jsonl
-from rrc.pipeline.stubs import FakeModel
-from rrc.run import run_proof
+from rrc.memory import task_case_shape
+from rrc.model import CodexModel, parse_codex_jsonl
+from rrc.pipeline.template import templatize
 from rrc.store import SQLiteTemplateStore
 from rrc.workload import two_task_workload
 
@@ -54,41 +55,27 @@ def _spec_json() -> str:
                 "fields": [],
                 "constants": ["2"],
                 "edge_values": [],
-                "values": {"function": "return_two", "number": "2"},
             },
         },
         separators=(",", ":"),
     )
 
 
-def test_lane_b_two_store_proof_misses_then_reuses_without_spec(tmp_path: Path) -> None:
-    client = FakeEverOS()
+def test_lane_b_store_round_trips_the_canonical_template_bundle(tmp_path: Path) -> None:
     store = SQLiteTemplateStore(tmp_path / "templates.sqlite")
-    retrieval = EverOSRetrieval(store, client)
-    model = FakeModel(
-        {
-            "spec": [_spec_json()],
-            "implement": [
-                "def return_two(value: int) -> int:\n    return 2",
-                "def return_three(value: int) -> int:\n    return 3",
-            ],
-        }
+    template = templatize(
+        Spec(
+            "Implement return_two and always return 2.",
+            "def return_two(value: int) -> int",
+            "Return the constant 2 for every integer input.",
+            ("def test_behavior():\n    assert return_two(99) == 2",),
+            Slots(identifiers=("return_two",), constants=("2",)),
+        ),
+        slot_values=(("function", "return_two"), ("number", "2")),
+        primary="return_two",
     )
-
-    evidence = run_proof(
-        client,
-        retrieval,
-        model,
-        tmp_path / "evidence.json",
-        cfg=Config(top_k=2, tau_floor=0.4),
-    )
-
-    assert evidence["pass"] is True
-    assert evidence["stored_external_ref"] == evidence["retrieved_external_ref"]
-    assert [call[3] for call in model.calls] == ["spec", "implement", "implement"]
-    assert client.wait_calls == 1
-    assert all(top_k == 2 and score == 0.4 for _, top_k, score in client.search_args)
-    assert len(set(client.indexed_shapes)) == 1
+    store.put(template)
+    assert store.get(template.external_ref) == template
 
 
 def test_case_shape_removes_values_but_is_stable_across_instances() -> None:
@@ -105,6 +92,8 @@ def test_case_shape_removes_values_but_is_stable_across_instances() -> None:
 def test_codex_jsonl_parser_preserves_split_usage() -> None:
     stdout = "\n".join(
         (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
             json.dumps(
                 {
                     "type": "item.completed",
@@ -116,7 +105,9 @@ def test_codex_jsonl_parser_preserves_split_usage() -> None:
                     "type": "turn.completed",
                     "usage": {
                         "input_tokens": 11,
+                        "cached_input_tokens": 0,
                         "output_tokens": 7,
+                        "reasoning_output_tokens": 0,
                         "total_tokens": 18,
                     },
                 }
@@ -128,3 +119,74 @@ def test_codex_jsonl_parser_preserves_split_usage() -> None:
 
     assert text == "artifact"
     assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (11, 7, 18)
+
+
+def test_codex_jsonl_parser_rejects_tools_errors_or_duplicate_finals() -> None:
+    base = [
+        {"type": "thread.started", "thread_id": "thread-1"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "one"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+    mutations = (
+        [*base[:2], {"type": "item.completed", "item": {"type": "command_execution"}}, *base[2:]],
+        [*base[:3], base[2], base[3]],
+        [*base[:2], {"type": "error", "message": "failed"}, *base[2:]],
+        [*base, base[3]],
+    )
+    for rows in mutations:
+        with pytest.raises(ValueError):
+            parse_codex_jsonl("\n".join(json.dumps(row) for row in rows))
+
+
+def test_codex_model_uses_empty_stage_cwd_stdin_and_frozen_zero_tool_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        cwd_value = kwargs["cwd"]
+        assert isinstance(cwd_value, (str, Path))
+        cwd = Path(cwd_value)
+        captured.update(
+            argv=argv,
+            input=kwargs.get("input"),
+            cwd=cwd,
+            children=tuple(cwd.iterdir()),
+        )
+        stdout = "\n".join(
+            json.dumps(row)
+            for row in (
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "artifact"},
+                },
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 2,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 1,
+                        "reasoning_output_tokens": 0,
+                    },
+                },
+            )
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = CodexModel(executable="codex-test").complete(
+        ModelRole.SMALL, "PROMPT", RunContext("cold", "task-1", "owner"), "implement"
+    )
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert result.text == "artifact"
+    assert captured["input"] == "PROMPT"
+    assert captured["children"] == ()
+    assert "--ignore-user-config" in argv
+    assert argv.count("--disable") == 3
+    assert 'model_reasoning_effort="low"' in argv
+    assert 'service_tier="priority"' in argv
+    assert argv[-1] == "-"

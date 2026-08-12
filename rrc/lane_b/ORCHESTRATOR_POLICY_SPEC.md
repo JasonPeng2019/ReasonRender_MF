@@ -1,5 +1,9 @@
 # Lane B product-orchestrator policy contract
 
+> **Historical / non-RRCv2 / superseded.** This policy is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> packet-oriented orchestrator route below is fixture-only/non-product.
+
 This is the fixed policy used by the **product runtime controller**.  It tells
 the product planning orchestrator how to create a reusable Plan + Spec packet
 for its worker.  It is not coding-orchestrator memory and is never sent to

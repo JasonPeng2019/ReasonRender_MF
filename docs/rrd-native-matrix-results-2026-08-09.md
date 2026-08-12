@@ -1,5 +1,10 @@
 # Native Codex ContextMesh + ReasonRenderCoding matrix — 2026-08-09
 
+> **Historical / non-RRCv2 / superseded.** These experiment results are retained only for
+> reproducibility; they are not current product guidance or evidence for the active RRCv2 pipeline.
+> ADR 0002 and `docs/RRCv2.md` govern the active implementation; this handler-audit route is
+> fixture-only/non-product.
+
 ## Scope and interpretation
 
 This is one controlled, sequential, final-protocol native-Codex replicate of the same HTTP-handler

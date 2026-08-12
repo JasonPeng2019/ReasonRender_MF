@@ -427,6 +427,8 @@ def test_planner_normalizes_controller_owned_audit_fields(tmp_path: Path) -> Non
     raw_packet["read_first"] = list(reversed(AUDIT_READ_FIRST))
     stdout = "\n".join(
         (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
             json.dumps(
                 {
                     "type": "item.completed",
@@ -436,7 +438,13 @@ def test_planner_normalizes_controller_owned_audit_fields(tmp_path: Path) -> Non
             json.dumps(
                 {
                     "type": "turn.completed",
-                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    "usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 5,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 15,
+                    },
                 }
             ),
         )
@@ -471,6 +479,8 @@ def test_planner_preserves_usage_when_response_json_is_invalid(tmp_path: Path) -
     task, _ = audit_task("bad-json", "Audit src/handlers/auth.js against the shared files.")
     stdout = "\n".join(
         (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
             json.dumps(
                 {
                     "type": "item.completed",
@@ -480,7 +490,13 @@ def test_planner_preserves_usage_when_response_json_is_invalid(tmp_path: Path) -
             json.dumps(
                 {
                     "type": "turn.completed",
-                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    "usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 5,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 15,
+                    },
                 }
             ),
         )
@@ -542,8 +558,10 @@ def test_four_parallel_warm_resolutions_make_one_planner_call(tmp_path: Path) ->
             "import json, os\n"
             f"open({str(calls)!r}, 'a').write('call\\n')\n"
             f"packet = {packet!r}\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'thread-1'}))\n"
+            "print(json.dumps({'type':'turn.started'}))\n"
             "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':packet}}))\n"
-            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5,'total_tokens':15}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':5,'reasoning_output_tokens':0,'total_tokens':15}}))\n"
         )
         codex.chmod(0o755)
         env = os.environ.copy()
@@ -627,8 +645,10 @@ def test_local_cli_miss_then_hit_ignores_a_poison_everos_listener(tmp_path: Path
             "#!/usr/bin/env python3\n"
             "import json\n"
             f"packet = {packet!r}\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'thread-1'}))\n"
+            "print(json.dumps({'type':'turn.started'}))\n"
             "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':packet}}))\n"
-            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5,'total_tokens':15}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':5,'reasoning_output_tokens':0,'total_tokens':15}}))\n"
         )
         codex.chmod(0o755)
         common = [

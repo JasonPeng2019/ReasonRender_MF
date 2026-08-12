@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from decimal import ROUND_HALF_EVEN, Decimal
+from fractions import Fraction
 
-from rrc.contract import Candidate, Config, RetrievalPort, SolveOutcome, Task, Template
+from rrc.contract import Candidate, Config, RetrievalPort, ScoreV1, SolveOutcome, Task, Template
 from rrc.everos import EverOSClient
 from rrc.pipeline.template import parse_task_metadata
 from rrc.store import SQLiteTemplateStore
@@ -35,6 +37,9 @@ class EverOSRetrieval(RetrievalPort):
         self._last_stored_ref: str | None = None
         self._last_retrieved_ref: str | None = None
         self._selected_template: Template | None = None
+        # Legacy adapter only. The canonical M3 adapter is repository-bound.
+        self.authority_id = "legacy-everos-adapter"
+        self.database_uuid = "0" * 64
 
     @property
     def last_stored_ref(self) -> str | None:
@@ -54,13 +59,20 @@ class EverOSRetrieval(RetrievalPort):
         self._last_retrieved_ref = None
         self._selected_template = None
         candidates = self._client.search(
-            task_case_shape(task), top_k=cfg.top_k, min_score=cfg.tau_floor
+            task_case_shape(task),
+            top_k=cfg.top_k,
+            min_score=cfg.tau_floor.numerator / cfg.tau_floor.denominator,
         )
-        return [
-            Candidate(external_ref, score)
-            for external_ref, score in candidates
-            if external_ref and 0.0 <= score <= 1.0
-        ]
+        result: list[Candidate] = []
+        for external_ref, score in candidates:
+            if not external_ref or not 0.0 <= score <= 1.0:
+                continue
+            quantized = Decimal(str(score)).quantize(Decimal("0.000000001"), ROUND_HALF_EVEN)
+            fraction = Fraction(quantized)
+            result.append(
+                Candidate(external_ref, ScoreV1(fraction.numerator, fraction.denominator))
+            )
+        return result
 
     def get_template(self, external_ref: str) -> Template | None:
         """Resolve one candidate strictly through the SQLite store of record."""

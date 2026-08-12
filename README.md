@@ -21,20 +21,31 @@ uv run pyright
 uv run pytest
 ```
 
-These checks validate the repository itself. The deliberately small ship-it-fast generated-code
-verifier runs pytest in a temporary subprocess with a timeout; Ruff and Pyright stages are deferred.
+These checks validate the repository itself. Candidate code uses the sealed RRCv2 verifier: ordered
+assembly, pinned Ruff normalization, signature conformance where the Spec supplies a signature,
+Pyright basic, and pytest collection/execution inside the capability-probed sandbox. Verification
+evidence is content-bound and fail-closed; it is not the earlier temporary-subprocess verifier.
 
-Lane A's frozen public call is `solve(task, *, mode, model, retrieval, cfg)`. It supports COLD and
-WARM, emits one `CostEvent` per model call, stores only canonical generic templates after WARM
-success, and exposes persistence failures as `StoreFailure` with the completed outcome attached.
-See [ADR 0001](docs/decisions/0001-rrcv2-full-two-store-contract.md).
+The canonical pipeline supports COLD and WARM, classifies retrieval as EXACT, NEAR, or MISS, and
+runs REUSE, PRIME, or a fresh strong SPEC before small-model implementation. It records one
+`CostEvent` per model call, performs two bounded repairs and a fresh strong fallback when needed,
+and stores templates/index rows only after acceptance. SQLite is authoritative and works offline;
+EverOS is optional. ContextMesh transports exact source/Spec inputs to source-blind native Codex
+workers without duplicate source delivery. See the current
+[ADR 0002](docs/decisions/0002-rrcv2-full-contextmesh-profile.md), the
+[requirement map](docs/rrcv2-requirement-map.md), and the
+[convergence report](docs/rrcv2-convergence-report.md). ADR 0001 is superseded and retained only as
+a historical fixture.
 
 ## Layout
 
 ```text
 rrc/
   contract.py       Frozen interface shared by Lane A and Lane B
-  pipeline/         Lane A solve, model-stage, template, and verification modules
+  pipeline/         Solve, model-stage, template, and sealed verification modules
+  retrieval.py      EXACT/NEAR/MISS local retrieval and classification
+  journal.py        Durable attempts, calls, evidence, acceptance, and local index
+  contextmesh*.py   Exact-context native-worker transport
 tests/
   pipeline/         Offline Lane A tests and fixtures
 docs/               RRCv2 design and lane build sheets

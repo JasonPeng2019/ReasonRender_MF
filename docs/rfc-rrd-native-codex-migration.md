@@ -1,11 +1,16 @@
 # PLAN — Native Codex migration for ContextMesh + ReasonRenderCoding
 
+> **Historical / non-RRCv2 / superseded.** This migration record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. Legacy provider and handler-audit routes below are fixture-only/non-product.
+
 > Written before implementation on 2026-08-08. This supersedes the Ollama runtime portions of
 > `docs/rfc-rrd-dual-memory-backends.md` without rewriting historical run evidence.
 >
 > **Status:** historical, non-normative planning record. The implemented comparison contract and
 > deviations are defined by `docs/rfc-rrd-unbounded-native-matrix.md` and
-> `docs/rrd-native-matrix-results-2026-08-09.md`. Unchecked prescriptive text below records the
+> `docs/rrd-native-matrix-results-2026-08-09.md`. The current hierarchical single-delivery/four-way
+> experiment contract is `docs/rfc-rrd-hierarchical-four-way-ablation.md`. Unchecked prescriptive text below records the
 > original proposal and must not be read as a claim about current bytes.
 
 ## Goal

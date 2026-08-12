@@ -1,0 +1,1 @@
+{"tests":["def test_product_label_stable():\n    assert Product().label() == \"Product\""],"v":1}

@@ -1,5 +1,9 @@
 # PLAN — Unbounded native Codex product comparison
 
+> **Historical / non-RRCv2 / superseded.** This experiment record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. The handler-audit matrix below is fixture-only/non-product.
+
 ## Goal
 
 Run and report the complete controlled comparison requested by the operator: native Codex baseline

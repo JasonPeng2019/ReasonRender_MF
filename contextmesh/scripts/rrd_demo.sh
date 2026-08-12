@@ -6,8 +6,8 @@
 #   RRDdemo-local.sh  prep|a|b|meter|down  (local SQLite/files only)
 #
 # `a`: open the COLD Codex TUI; `b`: open the WARM Codex TUI; `meter` belongs
-# in the third terminal. Paste the same four-handler audit prompt into both;
-# each root launches four native worker subagents.
+# in the third terminal. Each side generates and submits one canonical coding
+# assignment; each root launches one source-blind native worker subagent.
 set -euo pipefail
 
 BACKEND="${RRD_MEMORY_BACKEND:-}"
@@ -44,8 +44,7 @@ case "$cmd" in
     "$ROOT/scripts/rrd_demo_tui.sh" seed
     load_round
     mkdir -p "$ROUND_DIR"
-    cp "$ROOT/RRD-demo-prompt.txt" "$ROOT/runs/RRD-demo-prompt.txt"
-    command -v pbcopy >/dev/null && pbcopy < "$ROOT/RRD-demo-prompt.txt" && echo "audit prompt copied to clipboard"
+    echo "round prepared; each a/b launcher generates and submits its bound RRCv2 prompt"
     ;;
   login)
     candidate="${RRD_CODEX_BIN:-$(command -v codex || true)}"
@@ -69,6 +68,11 @@ case "$cmd" in
     exec python3 "$ROOT/scripts/rrd_combined_meter.py" \
       --round "$ROUND" --memory-backend "$BACKEND" --watch
     ;;
-  prompt)  cat "$ROOT/RRD-demo-prompt.txt" ;;
+  prompt)
+    load_round
+    latest="$ROUND_DIR/a/RRCv2-demo-prompt.txt"
+    [ -s "$latest" ] || { echo "Start side a or b to generate its bound prompt." >&2; exit 1; }
+    cat "$latest"
+    ;;
   *) sed -n '2,10s/^# \{0,1\}//p' "$ROOT/scripts/rrd_demo.sh" ;;
 esac

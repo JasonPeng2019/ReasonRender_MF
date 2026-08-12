@@ -1,297 +1,266 @@
+from __future__ import annotations
+
+import hashlib
 from dataclasses import replace
 
 import pytest
-from rrc.contract import Slots, Spec, Task, Template
+from rrc.contract import Slots, Spec, StructuralShapeV1, Task
 from rrc.pipeline.template import (
     TemplateError,
-    fingerprint,
+    derive_bindings,
     parse_task_metadata,
+    parse_template_bundle,
     render,
     resolve_template,
+    retrieval_primary,
+    signature_declaration_source,
+    signature_symbols,
+    template_bundle_bytes,
     templatize,
+    tier_minus_one,
     validate_spec_for_task,
 )
 
 from tests.pipeline.helpers import make_spec, make_task
 
 
-def test_markers_parse_to_canonical_ordered_types_and_sorted_fields() -> None:
+def test_task_owned_metadata_is_the_binding_authority() -> None:
     shape, values = parse_task_metadata(make_task())
     assert (shape.arity, shape.arg_types, shape.fields) == (1, ("int",), ("order_id",))
-    assert values == {"entity": "Order", "function": "get_order", "field": "order_id"}
+    assert values == {"entity": "Order", "field": "order_id", "function": "get_order"}
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "no markers",
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":[],"extra":1}\n'
-        'RRC_SLOT_VALUES: {"function":"f"}',
-        'RRC_SHAPE: {"arity":1,"arity":1,"arg_types":["int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"function":"f"}',
-        'RRC_SHAPE: {"arity":2,"arg_types":["int"],"fields":[]}\nRRC_SLOT_VALUES: {"function":"f"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":["id","id"]}\n'
-        'RRC_SLOT_VALUES: {"function":"f"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"left":"value","right":"value"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"left":"Order","right":"Orders"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":["not valid"]}\n'
-        'RRC_SLOT_VALUES: {"function":"valid_function"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"function":"bad-name"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"function":"9bad"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["factory()"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"function":"valid_function"}',
-        'RRC_SHAPE: {"arity":1,"arg_types":["lambda: int"],"fields":[]}\n'
-        'RRC_SLOT_VALUES: {"function":"valid_function"}',
-    ],
-)
-def test_marker_schema_rejects_malformed_colliding_or_aliased_values(text: str) -> None:
-    with pytest.raises(TemplateError):
-        parse_task_metadata(replace(make_task(), text=text))
-
-
-@pytest.mark.parametrize(
-    "annotation",
-    [
-        "int",
-        "list[str]",
-        "typing.Optional[int]",
-        "dict[str, list[int | None]]",
-        "tuple[int, ...]",
-    ],
-)
-def test_marker_schema_accepts_supported_type_grammar(annotation: str) -> None:
-    task = Task(
-        "valid-type",
-        "Build valid_function.\n"
-        f'RRC_SHAPE: {{"arity":1,"arg_types":["{annotation}"],'
-        '"fields":["valid_field"]}\n'
-        'RRC_SLOT_VALUES: {"function":"valid_function","field":"valid_field"}',
-    )
-    shape, _ = parse_task_metadata(task)
-    assert shape.arg_types
-
-
-def test_spec_rejects_invalid_identifier_and_type_label_values() -> None:
-    base_task = make_task()
-    identifier_task = replace(
-        base_task,
-        text=base_task.text.replace(
-            '"field":"order_id"}', '"field":"order_id","alias":"bad-name"}'
-        ),
-    )
-    identifier_spec = replace(
-        make_spec(),
-        plan=make_spec().plan + " bad-name",
-        slots=replace(
-            make_spec().slots,
-            identifiers=("get_order", "bad-name"),
-            values={**make_spec().slots.values, "alias": "bad-name"},
-        ),
-    )
-    assert validate_spec_for_task(identifier_spec, identifier_task) is False
-
-    type_task = replace(
-        base_task,
-        text=base_task.text.replace(
-            '"field":"order_id"}', '"field":"order_id","type":"factory()"}'
-        ),
-    )
-    type_spec = replace(
-        make_spec(),
-        plan=make_spec().plan + " factory()",
-        slots=replace(
-            make_spec().slots,
-            types=("factory()",),
-            values={**make_spec().slots.values, "type": "factory()"},
-        ),
-    )
-    assert validate_spec_for_task(type_spec, type_task) is False
-
-
-def test_full_spec_templatizes_nested_fields_and_round_trips_defensively() -> None:
-    concrete = make_spec()
-    template = templatize(concrete)
-    skeleton = template.spec_skeleton
-    assert skeleton.signature == "def {function}({field}: int) -> int"
-    assert skeleton.slots.entity == "{entity}"
-    assert skeleton.slots.identifiers == ("{function}",)
-    assert skeleton.slots.fields == ("{field}",)
-    assert skeleton.slots.values == {
-        "entity": "{entity}",
-        "field": "{field}",
-        "function": "{function}",
+def test_spec_has_only_the_six_original_slot_fields() -> None:
+    assert set(make_spec().slots.as_json()) == {
+        "entity",
+        "identifiers",
+        "types",
+        "fields",
+        "constants",
+        "edge_values",
     }
-    rendered = render(template, dict(concrete.slots.values))
-    assert rendered == concrete
-    rendered.slots.values["field"] = "mutated"
-    assert template.spec_skeleton.slots.values["field"] == "{field}"
 
 
-def test_every_nested_slot_category_is_templatized() -> None:
-    values = {
-        "entity": "Order",
-        "identifier": "get_order",
-        "type": "Money",
-        "field": "order_id",
-        "constant": "ZERO",
-        "edge": "EMPTY",
-    }
-    specification = Spec(
-        plan="Order get_order Money order_id ZERO EMPTY",
-        signature="def get_order(order_id: Money) -> Money",
-        contract="Order Money ZERO EMPTY",
-        tests=("def test_behavior(): assert get_order(ZERO) == EMPTY",),
-        slots=Slots(
-            entity="Order",
-            identifiers=("get_order",),
-            types=("Money",),
-            fields=("order_id",),
-            constants=("ZERO",),
-            edge_values=("EMPTY",),
-            values=values,
-        ),
+def test_templatize_round_trips_spec_and_independent_tests() -> None:
+    task = make_task()
+    spec = make_spec()
+    independent = ("def test_independent():\n    assert get_order(7) == 7",)
+    template = templatize(
+        spec,
+        independent,
+        slot_values=task.slot_values,
+        primary=task.primary,
     )
-    template = templatize(specification)
-    slots = template.spec_skeleton.slots
-    assert slots.entity == "{entity}"
-    assert slots.identifiers == ("{identifier}",)
-    assert slots.types == ("{type}",)
-    assert slots.fields == ("{field}",)
-    assert slots.constants == ("{constant}",)
-    assert slots.edge_values == ("{edge}",)
-    assert render(template, values) == specification
+    rendered_spec, rendered_independent = render(template, dict(task.slot_values or ()))
+    assert rendered_spec == spec
+    assert rendered_independent == independent
+    assert template.slot_names == ("entity", "field", "function")
+    assert template.external_ref == hashlib.sha256(template_bundle_bytes(template)).hexdigest()
 
 
-def test_external_ref_is_canonical_sha256_and_checked_on_load() -> None:
-    template = templatize(make_spec())
-    assert (
-        template.external_ref == "193ee2b510f3c456b5b7a0454505857a5aab4e12d764dbd9b01d9ca1bdbcd224"
-    )
-    assert template.external_ref == fingerprint(template.spec_skeleton, template.slot_names)
-    reversed_values = replace(
-        make_spec().slots,
-        values={"function": "get_order", "field": "order_id", "entity": "Order"},
-    )
-    assert (
-        templatize(replace(make_spec(), slots=reversed_values)).external_ref
-        == template.external_ref
-    )
-    corrupt = Template("0" * 64, template.spec_skeleton, template.slot_names)
-    assert resolve_template(corrupt, make_task()) is None
-    malformed = Template("x", None, ("entity",))  # type: ignore[arg-type]
-    assert resolve_template(malformed, make_task()) is None
-
-
-def test_templatize_rejects_preexisting_placeholders_and_concrete_leakage() -> None:
-    concrete = make_spec()
+def test_template_bundle_strictly_reopens_and_rejects_mutation() -> None:
+    task = make_task()
+    template = templatize(make_spec(), slot_values=task.slot_values, primary=task.primary)
+    raw = template_bundle_bytes(template)
+    assert parse_template_bundle(raw) == template
     with pytest.raises(TemplateError):
-        templatize(replace(concrete, plan=concrete.plan + " {entity}"))
-    with pytest.raises(TemplateError):
-        templatize(replace(concrete, contract="Orderly behavior returns order_id."))
+        parse_template_bundle(raw + b"\n")
 
 
-def test_slot_name_may_equal_its_concrete_value_without_false_leakage() -> None:
-    specification = Spec(
-        plan="Use id.",
-        signature="def fetch(id: int) -> int",
-        contract="Return id.",
-        tests=("def test_behavior(): assert fetch(1) == 1",),
-        slots=Slots(fields=("id",), values={"id": "id"}),
+def test_resolve_exact_shape_uses_task_bindings() -> None:
+    first = make_task()
+    template = templatize(make_spec(), slot_values=first.slot_values, primary=first.primary)
+    second = make_task(
+        task_id="order-2",
+        entity="Purchase",
+        function="find_purchase",
+        field="purchase_id",
     )
-    template = templatize(specification)
-    assert template.spec_skeleton.slots.values == {"id": "{id}"}
-    assert render(template, {"id": "id"}) == specification
+    rendered = resolve_template(template, second)
+    assert rendered is not None
+    assert rendered.signature == "def find_purchase(purchase_id: int) -> int"
 
 
-@pytest.mark.parametrize(
-    ("task", "expected"),
-    [
-        (make_task(task_id="new", entity="Purchase", function="fetch_purchase", field="key"), True),
-        (make_task(arg_type="str"), False),
-        (
-            replace(
-                make_task(),
-                text=make_task().text.replace(
-                    '"arity":1,"arg_types":["int"]',
-                    '"arity":2,"arg_types":["int","int"]',
-                ),
-            ),
-            False,
-        ),
-        (
-            replace(
-                make_task(field="key"),
-                text=make_task(field="key").text.replace(
-                    '"fields":["key"]', '"fields":["order_id"]'
-                ),
-            ),
-            False,
-        ),
-    ],
-)
-def test_resolution_requires_exact_key_arity_type_and_field_shape(
-    task: Task, expected: bool
-) -> None:
-    resolved = resolve_template(templatize(make_spec()), task)
-    assert (resolved is not None) is expected
+def test_shape_mismatch_is_not_exact_reuse() -> None:
+    task = make_task()
+    template = templatize(make_spec(), slot_values=task.slot_values, primary=task.primary)
+    mismatched = make_task(arg_type="str")
+    assert resolve_template(template, mismatched) is None
 
 
-def test_resolution_rejects_missing_extra_or_empty_slot_sets_and_bad_sanity() -> None:
-    template = templatize(make_spec())
-    base = make_task()
-    extra = replace(
-        base,
-        text=base.text.replace('"field":"order_id"}', '"field":"order_id","extra":"EXTRA"}'),
+def test_controller_binding_must_cover_every_semantic_value() -> None:
+    with pytest.raises(TemplateError, match="cover"):
+        derive_bindings(
+            make_spec(),
+            (("function", "get_order"),),
+            primary="get_order",
+        )
+
+
+def test_derived_bindings_coalesce_exact_equal_semantic_values() -> None:
+    spec = Spec(
+        "Use User.",
+        "def build(value: User) -> User",
+        "Return User.",
+        ("def test_build():\n    assert build(User())",),
+        Slots(entity="User", types=("User",), identifiers=("build",)),
     )
-    empty = replace(base, text=base.text.replace('"field":"order_id"', '"field":""'))
-    missing = replace(base, text=base.text.replace(',"field":"order_id"', ""))
-    assert resolve_template(template, extra) is None
-    assert resolve_template(template, empty) is None
-    assert resolve_template(template, missing) is None
-
-    no_function_test = replace(make_spec(), tests=('def test_behavior(): assert "get_order"',))
-    assert resolve_template(templatize(no_function_test), base) is None
+    bindings, _ = derive_bindings(spec, None, primary="build")
+    assert len([pair for pair in bindings if pair[1] == "User"]) == 1
 
 
-def test_field_set_matching_ignores_order_but_rejects_duplicates_at_parse_time() -> None:
+def test_preexisting_placeholder_rejects() -> None:
+    task = make_task()
+    spec = replace(make_spec(), plan="Use {function}.")
+    with pytest.raises(TemplateError, match="placeholder"):
+        templatize(spec, slot_values=task.slot_values, primary=task.primary)
+
+
+def test_validate_spec_rejects_task_shape_or_primary_drift() -> None:
+    assert validate_spec_for_task(make_spec(), make_task())
+    assert not validate_spec_for_task(make_spec(function="other"), make_task())
+
+
+def test_fixed_shape_fields_are_not_required_to_be_controller_slots() -> None:
     task = Task(
-        "two-fields",
-        "Build lookup for Record.\n"
-        'RRC_SHAPE: {"arity":1,"arg_types":["int"],"fields":["beta","alpha"]}\n'
-        'RRC_SLOT_VALUES: {"entity":"Record","function":"lookup",'
-        '"first":"alpha","second":"beta"}',
+        "select",
+        "Select approved names.",
+        primary="select_names",
+        shape=StructuralShapeV1(("list[dict[str,str]]",), 1, ("name", "status")),
+        slot_values=(("active_value", "approved"), ("function", "select_names")),
     )
     specification = Spec(
-        plan="Record lookup alpha beta",
-        signature="def lookup(alpha: int) -> int",
-        contract="Return alpha; beta is the secondary Record field.",
-        tests=("def test_behavior(): assert lookup(1) == 1",),
-        slots=Slots(
-            entity="Record",
-            identifiers=("lookup",),
-            fields=("alpha", "beta"),
-            values={
-                "entity": "Record",
-                "function": "lookup",
-                "first": "alpha",
-                "second": "beta",
-            },
+        "Select names with status approved.",
+        "def select_names(records: list[dict[str, str]]) -> list[str]",
+        "Return approved names.",
+        (
+            "def test_public():\n"
+            "    assert select_names([{'name': 'a', 'status': 'approved'}]) == ['a']",
+        ),
+        Slots(
+            identifiers=("select_names",),
+            fields=("name", "status"),
+            constants=("approved",),
         ),
     )
-    assert resolve_template(templatize(specification), task) is not None
 
-
-def test_templatize_rejects_concrete_collisions_inside_spec() -> None:
-    specification = Spec(
-        plan="Use Order and Orders.",
-        signature="def build(value: int) -> int",
-        contract="Return value.",
-        tests=("def test_behavior(): assert build(1) == 1",),
-        slots=Slots(values={"one": "Order", "many": "Orders"}),
+    assert validate_spec_for_task(specification, task)
+    template = templatize(
+        specification,
+        slot_values=task.slot_values,
+        primary=task.primary,
     )
-    with pytest.raises(TemplateError):
-        templatize(specification)
+    assert template.slot_names == ("active_value", "function")
+
+
+def test_literal_slot_fragments_render_inside_python_strings() -> None:
+    specification = Spec(
+        "Split using ~.",
+        "def split_value(raw: str) -> list[str]",
+        "Use ~ as the delimiter.",
+        ("def test_public():\n    assert split_value('a~b') == ['a', 'b']",),
+        Slots(identifiers=("split_value",), constants=("~",)),
+    )
+    template = templatize(
+        specification,
+        slot_values=(("delimiter", "~"), ("function", "split_value")),
+        primary="split_value",
+    )
+    rendered, _ = render(
+        template,
+        {"delimiter": ";", "function": "split_semicolon"},
+    )
+
+    assert rendered.tests == (
+        "def test_public():\n    assert split_semicolon('a;b') == ['a', 'b']",
+    )
+
+
+def test_frozen_two_artifact_template_bundle_golden() -> None:
+    specification = Spec(
+        "Return 1.",
+        "def get_order(x: int) -> int",
+        "Returns 1.",
+        ("def test_spec():\n    assert get_order(1) == 1",),
+        Slots(identifiers=("get_order",), constants=("1",)),
+    )
+    template = templatize(
+        specification,
+        ("def test_independent():\n    assert get_order(1) == 1",),
+        slot_values=(("constant", "1"), ("function", "get_order")),
+        primary="get_order",
+    )
+    assert template.external_ref == (
+        "90dc21dc7cf2ac6219408458ad709734c5c77cb0a917bea5e2ec7fd814d93771"
+    )
+    rendered, tests = render(
+        template,
+        {"constant": "2", "function": "fetch_order"},
+    )
+    assert rendered.tests == ("def test_spec():\n    assert fetch_order(1) == 2",)
+    assert tests == ("def test_independent():\n    assert fetch_order(1) == 2",)
+
+
+def test_header_only_signature_normalizes_to_verifier_declaration() -> None:
+    assert signature_declaration_source("def f(x: int) -> int") == ("def f(x: int) -> int: ...")
+    assert signature_symbols("def f(x: int) -> int") == {"f": ("int",)}
+
+
+def test_general_multi_signature_accepts_null_primary_but_does_not_index() -> None:
+    specification = Spec(
+        "Provide both public operations.",
+        "def alpha(x: int) -> int: ...\ndef beta(y: str) -> str: ...",
+        "Each operation returns its argument.",
+        (
+            "def test_alpha():\n    assert alpha(1) == 1",
+            "def test_beta():\n    assert beta('x') == 'x'",
+        ),
+        Slots(),
+    )
+    task = Task("multi", "Implement both public operations.")
+    assert validate_spec_for_task(specification, task)
+    assert retrieval_primary(specification, task) is None
+
+
+def test_general_multi_signature_honors_explicit_top_level_or_method_primary() -> None:
+    specification = Spec(
+        "Provide the selected operation.",
+        ("def alpha(x: int) -> int: ...\nclass Service:\n    def beta(self, y: str) -> str: ..."),
+        "Return the supplied value.",
+        ("def test_beta():\n    assert Service().beta('x') == 'x'",),
+        Slots(),
+    )
+    task = Task(
+        "method",
+        "Implement Service.beta.",
+        primary="Service.beta",
+        shape=StructuralShapeV1(("str",), 1, ()),
+        slot_values=(),
+    )
+    assert validate_spec_for_task(specification, task)
+    assert retrieval_primary(specification, task) == "Service.beta"
+    mismatched_hint = replace(task, primary="missing")
+    assert not validate_spec_for_task(specification, mismatched_hint)
+    assert validate_spec_for_task(specification, mismatched_hint, strict_primary=False)
+
+
+def test_tier_minus_one_uses_real_positional_and_keyword_binding_rules() -> None:
+    task = Task(
+        "binding",
+        "Implement f.",
+        primary="f",
+        shape=StructuralShapeV1(("int", "str", "bool"), 3, ()),
+        slot_values=(),
+    )
+    base = Spec(
+        "Implement f.",
+        "def f(x: int, /, y: str = 'd', *, flag: bool) -> int: ...",
+        "Return an integer.",
+        ("def test_ok():\n    assert f(1, flag=True) == 1",),
+        Slots(),
+    )
+    assert tier_minus_one(base, task)
+    wrong = replace(base, tests=("def test_bad():\n    assert f(x=1, flag=True) == 1",))
+    assert not tier_minus_one(wrong, task)
+    starred = replace(base, tests=("def test_bad():\n    assert f(*(1,), flag=True) == 1",))
+    assert not tier_minus_one(starred, task)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -13,7 +14,7 @@ from typing import Any
 import pytest
 
 REPO = Path(__file__).parents[1]
-PROMPT = (REPO / "contextmesh/RRD-demo-prompt.txt").read_text()
+PROMPT = (REPO / "contextmesh/demo-prompt.txt").read_text()
 HANDLERS = ("users", "products", "orders", "reviews")
 
 
@@ -380,3 +381,250 @@ def test_installed_codex_hook_failures_leave_four_workers_and_root_merge(
     assert result.returncode == 0, result.stderr
     assert "ROOT_MERGED workers=4" in result.stdout
     assert len([request for request in provider.requests if request["subagent"]]) == 4
+
+
+def _capability_matrix():
+    from contextmesh.scripts import rrcv2_capability_matrix
+
+    return rrcv2_capability_matrix
+
+
+def test_installed_codex_v1_stable_keyring_home_capability(tmp_path: Path) -> None:
+    from contextmesh.scripts import rrcv2_capability_preflight
+
+    stable = (REPO / "contextmesh/.codex-rrd-native").resolve()
+    assert Path(os.environ["CODEX_HOME"]).resolve() == stable
+    assert not (stable / "auth.json").exists()
+    assert (
+        rrcv2_capability_preflight.validate_sealed(repo=REPO, environ=os.environ)[
+            "provider_launch_total"
+        ]
+        == 0
+    )
+
+    status = subprocess.run(
+        ["codex", "-c", 'cli_auth_credentials_store="keyring"', "login", "status"],
+        env={
+            "HOME": os.environ["HOME"],
+            "CODEX_HOME": str(stable),
+            "PATH": os.environ["PATH"],
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
+            "TMPDIR": str(tmp_path),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert status.returncode == 0
+    assert "Logged in using ChatGPT" in status.stdout + status.stderr
+
+    fresh = tmp_path / "fresh-codex-home"
+    fresh.mkdir(mode=0o700)
+    fresh_status = subprocess.run(
+        ["codex", "-c", 'cli_auth_credentials_store="keyring"', "login", "status"],
+        env={
+            "HOME": os.environ["HOME"],
+            "CODEX_HOME": str(fresh),
+            "PATH": os.environ["PATH"],
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
+            "TMPDIR": str(tmp_path),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert fresh_status.returncode != 0
+    assert "Logged in using ChatGPT" not in fresh_status.stdout + fresh_status.stderr
+    assert not (fresh / "auth.json").exists()
+
+
+def test_installed_codex_v1_rrcv2_worker_evidence_capability() -> None:
+    summary = _capability_matrix().ensure(REPO)
+    worker = summary["results"][8]
+    assert worker["call_id"] == "cap-09-worker-small-low-native"
+    assert worker["surface_id"] == "worker_small_low_native"
+    assert worker["identity_attestation"] == "native_partial"
+    assert worker["effective_provider"] == "openai"
+    assert worker["effective_model"] == "gpt-5.6-luna"
+    assert worker["effective_reasoning"] == "low"
+    assert worker["effective_service_tier"] == "unattested"
+    assert worker["provider_total_tokens"] == worker["input_tokens"] + worker["output_tokens"]
+
+
+def test_installed_codex_v1_rrcv2_worker_does_not_inherit_root_source() -> None:
+    summary = _capability_matrix().ensure(REPO)
+    worker = summary["results"][8]
+    rollout = (
+        REPO
+        / ".generated/state/rrcv2-convergence/capability/calls"
+        / worker["call_id"]
+        / "rollout.jsonl"
+    ).read_bytes()
+    assert b"RRCV2_WORKER_CAPABILITY" in rollout
+    assert b"CAPABILITY_PRETOOL_REWRITE" in rollout
+    assert b"RRCV2_ROOT_PRIVATE_SENTINEL_8d0cbf61" not in rollout
+
+
+def test_installed_codex_v1_rrcv2_wait_substitution_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextmesh.scripts import rrcv2_capability_hook
+
+    monkeypatch.setattr(rrcv2_capability_hook, "CALL_ROOT", tmp_path)
+
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "multi_agent_v1wait_agent",
+        "tool_input": {"capability_synthetic": True},
+        "tool_response": {
+            "status": {
+                "agent-b": {"pending": True},
+                "agent-a": {"completed": "receipt-a"},
+            },
+            "timed_out": False,
+        },
+    }
+    first = rrcv2_capability_hook.handle(payload)
+    second = rrcv2_capability_hook.handle(payload)
+    assert first == second
+    assert first is not None and first["continue"] is False
+    stop_reason = first["stopReason"]
+    assert isinstance(stop_reason, str)
+    replacement = json.loads(stop_reason)
+    assert replacement["results"] == [
+        {"agent_id": "agent-a", "receipt": "receipt-a", "state": "accepted"},
+        {"agent_id": "agent-b", "state": "pending"},
+    ]
+
+
+def test_installed_codex_v1_rrcv2_stage_read_isolation_capability() -> None:
+    summary = _capability_matrix().ensure(REPO)
+    for row in summary["results"][:7]:
+        stdout = (
+            REPO
+            / ".generated/state/rrcv2-convergence/capability/calls"
+            / row["call_id"]
+            / "stdout.jsonl"
+        ).read_text()
+        assert '"type":"command_execution"' not in stdout
+        assert '"type":"mcp_tool_call"' not in stdout
+        assert '"type":"collab_tool_call"' not in stdout
+
+
+def test_installed_codex_v1_rrcv2_nested_spec_spawn_capability() -> None:
+    summary = _capability_matrix().ensure(REPO)
+    assert summary["exact_call_count"] == 9
+    assert len(summary["results"]) == 9
+    assert set(summary["surface_input_tokens_max"]) == {
+        "root_strong_medium_native",
+        "small_code_low",
+        "small_metadata_low",
+        "small_spec_low",
+        "small_tests_low",
+        "strong_code_medium",
+        "strong_spec_low",
+        "worker_small_low_native",
+    }
+    assert max(summary["surface_input_tokens_max"].values()) <= 65_536
+    root_dir = (
+        REPO
+        / ".generated/state/rrcv2-convergence/capability/calls/cap-08-root-strong-medium-native"
+    )
+    hook_events = [
+        json.loads(line) for line in (root_dir / "hook-events.jsonl").read_text().splitlines()
+    ]
+    names = {row["hook_event_name"] for row in hook_events}
+    assert {"PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop"} <= names
+
+
+def test_installed_codex_rrcv2_contextmesh_credibility_suite() -> None:
+    """Preserve failed v19 and consume the single reviewed v20 credibility attempt."""
+
+    failed_v19 = (
+        REPO
+        / ".generated/state/rrcv2-convergence/verify/cli-smoke/rrcv2-cli-smoke-v19"
+        / "d3e90e2ffbecf3b25891fa527c521c08c9505a514d04e6faeb26fdb071e0a57c"
+    )
+    assert hashlib.sha256((failed_v19 / "producer.json").read_bytes()).hexdigest() == (
+        "7b96ad27236e5f3d1254c16bf54f6ef7da570e5ee007d98200620e4ffb0f4f06"
+    )
+    assert hashlib.sha256((failed_v19 / "terminal.json").read_bytes()).hexdigest() == (
+        "fd3d673c9b1594fe368c33be0e275bae5de5fc8005e59ef821fda34b28d5344e"
+    )
+    assert json.loads((failed_v19 / "terminal.json").read_bytes())["status"] == "failure"
+
+    preimage = (
+        b'{"experiment_id":"rrcv2-cli-smoke-v20","fixture_manifest_sha256":'
+        b'"483db5cdc34b2ab16d99dd578ca87981e4b82e3d6ea53550be841fa7eedaaf39",'
+        b'"v":20}'
+    )
+    assert len(preimage) == 139
+    producer_sha = hashlib.sha256(preimage).hexdigest()
+    assert producer_sha == "7a66a30bbd2e7004724ba4aee1de7a879d87eb9212653e6a36d52d2cf1514744"
+    token = "rrcv2-cli-smoke-" + producer_sha[:32]
+    producer_root = (
+        REPO
+        / ".generated/state/rrcv2-convergence/verify/cli-smoke/rrcv2-cli-smoke-v20"
+        / producer_sha
+    )
+    assert not producer_root.exists(), "the one reviewed v20 producer was already consumed"
+    environment = dict(os.environ)
+    for name in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "RRC_EVEROS_URL",
+        "RRCV2_EVEROS_TARGET",
+    ):
+        environment.pop(name, None)
+    completed = subprocess.run(
+        [
+            "bash",
+            "contextmesh/scripts/rrd_demo_tui.sh",
+            "smoke",
+            "--fixture",
+            "tests/fixtures/rrcv2_cli_smoke/manifest.json",
+            "--round-id",
+            token,
+            "--timeout-ms",
+            "900000",
+        ],
+        cwd=REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=930,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((producer_root / "terminal.json").read_bytes()) == {
+        "producer_sha256": producer_sha,
+        "returncode": 0,
+        "status": "success",
+        "v": 1,
+    }
+    summary = json.loads((producer_root / "round/summary.json").read_bytes())
+    assert summary["kind"] == "rrcv2_cli_smoke_summary"
+    assert [row["task_id"] for row in summary["cells"]] == [
+        "rrcv2-cli-miss-001",
+        "rrcv2-cli-hit-001",
+        "rrcv2-cli-near-001",
+    ]
+    assert [row["branch"] for row in summary["cells"]] == ["miss", "reuse", "miss"]
+    assert [len(row["all_cost_event_ids"]) for row in summary["cells"]] == [4, 2, 4]
+    assert sum(len(row["all_cost_event_ids"]) for row in summary["cells"]) == 10
+    assert {"cache_render_rejection", "tier_minus_one"} <= set(
+        summary["cells"][2]["deterministic_stages"]
+    )
+    rows = [
+        json.loads(path.read_bytes())
+        for path in (producer_root / "round/cancellation/children").iterdir()
+    ]
+    assert rows and all(row["state"] == "terminal" for row in rows)
+    assert not (REPO / "contextmesh/.codex-rrd-native/auth.json").exists()

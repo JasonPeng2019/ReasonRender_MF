@@ -1,5 +1,9 @@
 # Lane A - Template Pipeline (fast, preserves the two-store design)
 
+> **Historical / non-RRCv2 / superseded.** This record is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. Any
+> fast-profile, one-repair, required-EverOS, or other reduced route below is fixture-only/non-product.
+
 **Build timer started:** 2026-08-07 12:29:11 -07:00
 
 This is the fast implementation profile. It keeps the load-bearing RRCv2

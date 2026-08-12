@@ -1,6 +1,10 @@
 # ADR 0001: Freeze the full RRCv2 two-store contract
 
-- **Status:** Accepted
+> **Historical / non-RRCv2 / superseded.** ADR 0002 supersedes this decision. This record is retained
+> only for design history and is not current product guidance; any reduced or one-repair route below
+> is fixture-only/non-product.
+
+- **Status:** Superseded by ADR 0002
 - **Date:** 2026-08-07
 - **Applies to:** Lane A and Lane B
 - **Source baseline:** `c429fbe:rrc/contract.py`

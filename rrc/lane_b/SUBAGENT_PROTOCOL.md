@@ -1,5 +1,9 @@
 # Lane B Coding Subagent Protocol
 
+> **Historical / non-RRCv2 / superseded.** This protocol is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> old coding-agent topology below is fixture-only/non-product.
+
 ## Roles
 
 - **Coding orchestrator:** owns coding slice order, scope, and code review.

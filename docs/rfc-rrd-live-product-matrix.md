@@ -1,5 +1,10 @@
 # PLAN — Live RRD product comparison matrix
 
+> **Historical / non-RRCv2 / superseded.** This experiment record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. Legacy provider, handler-audit, and comparison routes below are
+> fixture-only/non-product.
+
 > **Superseded experiment contract (2026-08-09):** the controlled native-Codex matrix is now
 > governed by `docs/rfc-rrd-unbounded-native-matrix.md`. The earlier Ollama transport, optional
 > fidelity cells, token ceilings, polling watchdog, and first-invalid abort below are retained only

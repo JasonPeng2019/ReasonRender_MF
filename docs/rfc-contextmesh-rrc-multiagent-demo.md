@@ -1,5 +1,10 @@
 # RFC — Combined ContextMesh + ReasonRenderCoding multi-agent demo
 
+> **Historical / non-RRCv2 / superseded.** This experiment record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. OpenCode, PlanSpecPacket, handler-audit, and required-EverOS routes below are
+> fixture-only/non-product.
+
 ## Goal
 
 Replace the mistaken standalone two-function `RRDdemo.sh` proof with a real combined demo:

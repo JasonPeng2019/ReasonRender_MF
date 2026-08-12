@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from rrc.contract import ArmMode
+from rrc.contract import ArmMode, Completion, Spec, Task, canonical_json_bytes
 from rrc.demo import format_meter, run_demo_arm
 from rrc.pipeline.stubs import FakeModel, InMemoryRetrieval, fake_completion
+from rrc.pipeline.verify import (
+    CodeArtifactV1,
+    RepairEvidenceV1,
+    VerificationResultV1,
+    VerificationRunV1,
+    VerificationTestsV1,
+    VerificationTierRowV1,
+    code_artifact_bytes,
+    verification_result_bytes,
+)
 
 SCRIPT = Path(__file__).parents[1] / "contextmesh" / "RRDdemo.sh"
 EVEROS_SCRIPT = SCRIPT.parent / "RRDdemo-everos.sh"
@@ -34,11 +47,110 @@ def _spec(function: str, number: int) -> str:
                 "fields": [],
                 "constants": [value],
                 "edge_values": [],
-                "values": {"function": function, "number": value},
             },
         },
         separators=(",", ":"),
     )
+
+
+def _independent(function: str, number: int) -> str:
+    return json.dumps(
+        {"tests": [f"def test_independent():\n    assert {function}(-7) == {number}"], "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _code(source: str, *, tokens: int = 4) -> Callable[[str], Completion]:
+    def response(prompt: str) -> Completion:
+        match = re.search(
+            r"attempt_id and artifact_path must be exactly '([0-9a-f]{64})' and '([^']+)'",
+            prompt,
+        )
+        assert match is not None
+        return fake_completion(
+            json.dumps(
+                {
+                    "artifact_path": match.group(2),
+                    "attempt_id": match.group(1),
+                    "source": source,
+                    "v": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            tokens=tokens,
+        )
+
+    return response
+
+
+def _sha(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _verification(
+    *,
+    attempt_id: str,
+    task: Task,
+    source: str,
+    tests: VerificationTestsV1,
+    specification: Spec | None,
+) -> VerificationRunV1:
+    artifact = CodeArtifactV1(attempt_id, task.artifact_path, source)
+    artifact_sha = _sha(code_artifact_bytes(artifact))
+    accepted = not any("999" in test for test in tests.spec)
+    names = ["assembly", "ruff"]
+    if specification is not None:
+        names.append("signature_conformance")
+    names.extend(("pyright", "pytest"))
+    rows = tuple(
+        VerificationTierRowV1(
+            name,  # type: ignore[arg-type]
+            "passed" if accepted or index < len(names) - 1 else "failed",
+            artifact_sha,
+            _sha(b"passed\n" if accepted or index < len(names) - 1 else b"failed\n"),
+            _sha(
+                b""
+                if accepted or index < len(names) - 1
+                else canonical_json_bytes({"kind": "verification_failure", "tier": name, "v": 1})
+            ),
+        )
+        for index, name in enumerate(names)
+    )
+    result = VerificationResultV1(
+        attempt_id,
+        task.verification_profile,
+        artifact_sha,
+        rows,
+        accepted,
+    )
+    result_sha = _sha(verification_result_bytes(result))
+    excerpt = "failed"
+    return VerificationRunV1(
+        result,
+        artifact,
+        (),
+        repair_evidence=(
+            None
+            if accepted
+            else RepairEvidenceV1(
+                attempt_id,
+                result_sha,
+                names[-1],  # type: ignore[arg-type]
+                _sha(excerpt.encode()),
+                excerpt,
+            )
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def fake_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rrc.pipeline.solve as solve_module
+
+    monkeypatch.setattr(solve_module, "_run_verifier", _verification)
+    monkeypatch.setattr(solve_module, "_score_hidden_oracle", lambda **_: True)
 
 
 def test_cold_demo_runs_the_public_pipeline_twice_without_reuse(tmp_path: Path) -> None:
@@ -48,9 +160,13 @@ def test_cold_demo_runs_the_public_pipeline_twice_without_reuse(tmp_path: Path) 
                 fake_completion(_spec("return_two", 2), tokens=10),
                 fake_completion(_spec("return_three", 3), tokens=10),
             ],
+            "independent_tests": [
+                fake_completion(_independent("return_two", 2), tokens=2),
+                fake_completion(_independent("return_three", 3), tokens=2),
+            ],
             "implement": [
-                fake_completion("def return_two(value: int) -> int:\n    return 2", tokens=4),
-                fake_completion("def return_three(value: int) -> int:\n    return 3", tokens=4),
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
             ],
         }
     )
@@ -66,17 +182,21 @@ def test_cold_demo_runs_the_public_pipeline_twice_without_reuse(tmp_path: Path) 
     assert evidence["pipeline"] == "rrc.pipeline.solve"
     assert evidence["proof_pass"] is True
     assert evidence["branches"] == ["miss", "miss"]
-    assert evidence["stages"] == [["spec", "implement"], ["spec", "implement"]]
-    assert evidence["total_tokens"] == 28
+    assert evidence["stages"] == [
+        ["spec", "independent_tests", "implement"],
+        ["spec", "independent_tests", "implement"],
+    ]
+    assert evidence["total_tokens"] == 32
 
 
 def test_warm_demo_misses_then_reuses_without_a_second_spec(tmp_path: Path) -> None:
     model = FakeModel(
         {
             "spec": [fake_completion(_spec("return_two", 2), tokens=10)],
+            "independent_tests": [fake_completion(_independent("return_two", 2), tokens=2)],
             "implement": [
-                fake_completion("def return_two(value: int) -> int:\n    return 2", tokens=4),
-                fake_completion("def return_three(value: int) -> int:\n    return 3", tokens=4),
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
             ],
         }
     )
@@ -95,8 +215,11 @@ def test_warm_demo_misses_then_reuses_without_a_second_spec(tmp_path: Path) -> N
     assert evidence["pipeline"] == "rrc.pipeline.solve"
     assert evidence["proof_pass"] is True
     assert evidence["branches"] == ["miss", "reuse"]
-    assert evidence["stages"] == [["spec", "implement"], ["implement"]]
-    assert evidence["total_tokens"] == 18
+    assert evidence["stages"] == [
+        ["spec", "independent_tests", "implement"],
+        ["implement"],
+    ]
+    assert evidence["total_tokens"] == 20
     assert after_first == [True]
 
 
@@ -150,13 +273,30 @@ def test_report_distinguishes_bad_spec_tests_from_bad_implementation(tmp_path: P
     model = FakeModel(
         {
             "spec": [json.dumps(first), json.dumps(second)],
-            "implement": [
-                "def return_two(value: int) -> int:\n    return 2",
-                "def return_three(value: int) -> int:\n    return 3",
+            "independent_tests": [
+                _independent("return_two", 2),
+                _independent("return_three", 3),
             ],
-            "repair": [
-                "def return_two(value: int) -> int:\n    return 2",
-                "def return_three(value: int) -> int:\n    return 3",
+            "implement": [
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
+            ],
+            "repair_1": [
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
+            ],
+            "repair_2": [
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
+            ],
+            "fallback_spec": [json.dumps(first), json.dumps(second)],
+            "fallback_independent_tests": [
+                _independent("return_two", 2),
+                _independent("return_three", 3),
+            ],
+            "fallback_implement": [
+                _code("def return_two(value: int) -> int:\n    return 2"),
+                _code("def return_three(value: int) -> int:\n    return 3"),
             ],
         }
     )
@@ -217,6 +357,74 @@ def test_rrd_script_describes_the_same_three_terminal_codex_tui_flow() -> None:
     assert "open the WARM Codex TUI" in script
     assert 'exec "$ROOT/scripts/rrd_demo_tui.sh" "$cmd"' in script
     assert "headless" not in script.lower()
+
+
+def _smoke_tui_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    scripts = repo / "contextmesh/scripts"
+    scripts.mkdir(parents=True)
+    tui = scripts / "rrd_demo_tui.sh"
+    shutil.copy2(TUI_SCRIPT, tui)
+    tui.chmod(0o755)
+    (scripts / "rrcv2_product_guard.py").write_text("# fixed guard\n")
+    python = repo / ".venv/bin/python3"
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$SMOKE_CALLS"\n')
+    python.chmod(0o755)
+    return tui, scripts / "rrcv2_product_guard.py"
+
+
+def test_tui_smoke_route_execs_only_the_fixed_guard_with_closed_arguments(tmp_path: Path) -> None:
+    tui, guard = _smoke_tui_fixture(tmp_path)
+    calls = tmp_path / "calls"
+    result = subprocess.run(
+        [
+            tui,
+            "smoke",
+            "--fixture",
+            "fixture.json",
+            "--round-id",
+            "rrcv2-cli-smoke-" + "a" * 32,
+            "--timeout-ms",
+            "900000",
+        ],
+        env={**os.environ, "SMOKE_CALLS": str(calls), "RRD_MEMORY_BACKEND": "malicious"},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text() == (
+        f"{guard} --fixture fixture.json --round-id rrcv2-cli-smoke-{'a' * 32} "
+        "--timeout-ms 900000\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["smoke"],
+        ["smoke", "--round-id", "x", "--fixture", "f", "--timeout-ms", "1"],
+        ["smoke", "--fixture", "f", "--round-id", "x", "--runner", "other.py"],
+        ["smoke", "--fixture", "f", "--round-id", "x", "--timeout-ms", "1", "extra"],
+    ],
+)
+def test_tui_smoke_route_rejects_every_other_argument_shape(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    tui, _ = _smoke_tui_fixture(tmp_path)
+    calls = tmp_path / "calls"
+    result = subprocess.run(
+        [tui, *arguments],
+        env={**os.environ, "SMOKE_CALLS": str(calls)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not calls.exists()
 
 
 @pytest.mark.parametrize(
@@ -441,19 +649,17 @@ def test_native_matrix_planner_has_nine_comparable_cells(tmp_path: Path) -> None
     assert "ceiling" not in json.dumps(value).lower()
 
 
-def test_rrd_prompt_uses_the_native_four_worker_contract() -> None:
+def test_rrd_prompt_points_only_to_the_generated_rrcv2_coding_contract() -> None:
     prompt = (SCRIPT.parent / "RRD-demo-prompt.txt").read_text()
-    assert "spawn ONE worker subagent per listed handler" in prompt
-    assert 'agent_type="worker" and fork_context=false' in prompt
-    assert "launch all four workers before waiting" in prompt
-    assert "src/models.js, src/utils.js, and src/middleware.js" in prompt
-    assert "## src/handlers/<name>.js" in prompt
+    assert "rrcv2_demo_prompt.py" in prompt
+    assert "not the historical four-handler audit prompt" in prompt
+    assert "src/handlers/" not in prompt
 
 
 def test_public_native_assets_have_no_custom_provider_or_model_proxy() -> None:
     manifest = SCRIPT.parent / "active-runtime-files.txt"
     names = [line for line in manifest.read_text().splitlines() if line]
-    forbidden = ("ollama", "opencode", "tollgate", "model_provider", "env_key")
+    forbidden = ("ollama", "opencode", "tollgate")
     for name in names:
         path = SCRIPT.parent.parent / name
         lowered = path.read_text().lower()

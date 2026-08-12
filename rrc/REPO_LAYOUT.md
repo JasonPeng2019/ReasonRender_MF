@@ -1,5 +1,9 @@
 # RRC Repository Organization Layout
 
+> **Historical / non-RRCv2 / superseded.** This layout is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active repository and
+> pipeline. The reduced Lane-B route below is fixture-only/non-product.
+
 Keep the RRC package flat. Lane B is a small sequential integration; it does
 not need provider, memory, or harness subpackages.
 

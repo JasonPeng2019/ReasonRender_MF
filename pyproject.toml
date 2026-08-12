@@ -12,9 +12,9 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-    "pyright>=1.1.400",
-    "pytest>=8.3",
-    "ruff>=0.11",
+    "pyright==1.1.411",
+    "pytest==9.1.1",
+    "ruff==0.16.2",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -24,6 +24,9 @@ packages = ["rrc"]
 addopts = ["-ra", "--strict-config", "--strict-markers"]
 minversion = "8.3"
 testpaths = ["tests"]
+markers = [
+    "sandbox_real: exercises the sealed task-local Docker verifier backend",
+]
 
 [tool.ruff]
 exclude = [

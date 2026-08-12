@@ -1,5 +1,9 @@
 # ContextMesh — Implementation Brief (post source-dive)
 
+> **Historical / non-RRCv2 / superseded.** This record is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. Any
+> OpenCode, Snowflake, required-EverOS, or handler-audit route below is fixture-only/non-product.
+
 Date: 2026-08-07 · Baseline: opencode v1.18.15 (`opencode-snowflake-hack`), EverOS v1.1.x, Snowflake
 Verdict: **build it — the thesis survives contact with the source.** Two spec assumptions are wrong (EverOS storage model, LSP availability) and both have clean workarounds. Several things are *easier* than the spec assumed.
 

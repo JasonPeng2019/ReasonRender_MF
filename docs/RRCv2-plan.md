@@ -1,11 +1,9 @@
 # RRCv2 — Ship-It-Fast Plan (4h, two lanes) — Codex CLI + EverOS + Snowflake
 
-> **SUPERSEDED CONTRACT PROFILE.** The family/params `Complete`/`Memory`/`Outcome` shortcut below
-> is retained only as historical context. Do not implement it. The authoritative shared seam is
-> `rrc/contract.py` from the full two-store design recorded in
-> [`decisions/0001-rrcv2-full-two-store-contract.md`](decisions/0001-rrcv2-full-two-store-contract.md),
-> with the active lane profiles in `RRCv2-lane-A-pipeline.md` and
-> `RRCv2-lane-B-memory-measure.md`.
+> **Historical / non-RRCv2 / superseded.** This record is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> family/params shortcut, required-EverOS/Snowflake route, and fast lane profiles below are
+> fixture-only/non-product and must not be implemented.
 
 **Goal (the only one):** lower **tokens per solved task**, measured. Win = a curve: warm (reuse stored specs via EverOS) tokens/solved falls below cold (no memory) as the workload repeats.
 

@@ -1,5 +1,9 @@
 # Shave If Low Time
 
+> **Historical / non-RRCv2 / superseded.** This schedule note is retained only for reproducibility;
+> it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation.
+> The reduced or required-EverOS route below is fixture-only/non-product.
+
 At two hours from the build timer, this file is authoritative. Never remove,
 disable, rewrite, or roll back a working implemented feature. Shave only an
 optional feature below that is still nonworking or unimplemented: do not start

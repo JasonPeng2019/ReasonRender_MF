@@ -1,5 +1,10 @@
 # PLAN — Dual EverOS and local-memory RRD demos
 
+> **Historical / non-RRCv2 / superseded.** This experiment record is retained only for
+> reproducibility; it is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active
+> implementation. Ollama, Tollgate, audit-packet, and required-EverOS routes below are
+> fixture-only/non-product.
+
 > Revised after `/adversarial` on 2026-08-08. This extends, rather than supersedes,
 > `docs/rfc-codex-ollama-contextmesh-rrc-demo.md`.
 

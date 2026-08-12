@@ -10,6 +10,8 @@ CODEX_CANDIDATE="${RRD_CODEX_BIN:-$(command -v codex || true)}"
 [ -n "$CODEX_CANDIDATE" ] || { echo "FAIL  Codex is not installed" >&2; exit 1; }
 CODEX_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_CANDIDATE")"
 MODEL="${RRD_CODEX_MODEL:-gpt-5.5}"
+WORKER_MODEL="${RRD_WORKER_MODEL:-gpt-5.6-luna}"
+WORKER_REASONING="${RRD_WORKER_REASONING:-low}"
 CODEX_COMMAND=("$CODEX_BIN")
 if [ "$(uname -s)" = Darwin ]; then
   [ -x /usr/bin/sandbox-exec ] || { echo "FAIL  macOS sandbox-exec is unavailable" >&2; exit 1; }
@@ -18,7 +20,8 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 
 python3 "$ROOT/scripts/rrd_native_config.py" check --root "$ROOT" \
-  --codex-bin "$CODEX_BIN" --model "$MODEL"
+  --codex-bin "$CODEX_BIN" --model "$MODEL" --worker-model "$WORKER_MODEL" \
+  --worker-reasoning "$WORKER_REASONING"
 
 if [ "$BACKEND" = everos ]; then
   /usr/bin/curl -sf -m 5 http://127.0.0.1:8000/health >/dev/null

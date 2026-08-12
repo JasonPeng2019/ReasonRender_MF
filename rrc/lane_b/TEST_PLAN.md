@@ -1,5 +1,9 @@
 # Lane B Live Test Plan
 
+> **Historical / non-RRCv2 / superseded.** This test plan is retained only for reproducibility; it
+> is not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> required-EverOS Lane-B route below is fixture-only/non-product.
+
 ## Goal
 
 Establish whether the normal Lane B path works end to end:

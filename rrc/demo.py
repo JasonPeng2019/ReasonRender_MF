@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -15,17 +16,18 @@ from typing import Any
 from rrc.contract import (
     ArmMode,
     Config,
+    InlineTaskInputV1,
     ModelPort,
-    NullRetrieval,
     RetrievalPort,
     SolveOutcome,
+    TargetPreimageV1,
     Task,
+    seal_task_input,
 )
-from rrc.everos import EverOSClient
-from rrc.memory import EverOSRetrieval
+from rrc.journal import SQLiteRRCRepository
 from rrc.model import CodexModel
-from rrc.pipeline import solve
-from rrc.store import SQLiteTemplateStore
+from rrc.pipeline.solve import solve
+from rrc.retrieval import SQLiteHybridRetrieval
 from rrc.workload import two_task_workload
 
 
@@ -45,6 +47,14 @@ def demo_workload(round_id: str) -> tuple[Task, Task]:
                 # crowding the fresh proof out of the bounded top-k results.
                 text=f"RRC_DEMO_ROUND: {round_id}\n{task.text}",
                 oracle_tests=task.oracle_tests,
+                family=task.family,
+                artifact_path=task.artifact_path,
+                public_tests=task.public_tests,
+                searchable_public=task.searchable_public,
+                verification_profile=task.verification_profile,
+                primary=task.primary,
+                shape=task.shape,
+                slot_values=task.slot_values,
             )
         )
     return tasks[0], tasks[1]
@@ -98,7 +108,7 @@ def run_demo_arm(
     round_id: str,
     mode: ArmMode,
     model: ModelPort,
-    retrieval: RetrievalPort,
+    retrieval: RetrievalPort | None,
     evidence_path: str | Path,
     cfg: Config | None = None,
     after_first: Callable[[], None] | None = None,
@@ -108,13 +118,42 @@ def run_demo_arm(
 
     if mode not in (ArmMode.COLD, ArmMode.WARM):
         raise ValueError("the RRC demo supports only COLD and WARM")
-    config = Config() if cfg is None else cfg
+    config = (
+        Config("demo-" + hashlib.sha256(round_id.encode()).hexdigest()[:32]) if cfg is None else cfg
+    )
+    del retrieval  # Retained only for compatibility with the historical demo API.
+    evidence_file = Path(evidence_path)
+    evidence_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    input_parent = evidence_file.parent / "inputs"
+    input_parent.mkdir(mode=0o700)
     outcomes: list[SolveOutcome] = []
-    for index, task in enumerate(demo_workload(round_id)):
-        outcome = solve(task, mode=mode, model=model, retrieval=retrieval, cfg=config)
-        outcomes.append(outcome)
-        if index == 0 and mode is ArmMode.WARM and outcome.passed and after_first is not None:
-            after_first()
+    with SQLiteRRCRepository(evidence_file.parent / "rrcv2-demo.sqlite3") as repository:
+        local_retrieval = SQLiteHybridRetrieval(repository)
+        for index, task in enumerate(demo_workload(round_id)):
+            primary = task.primary
+            if primary is None:
+                raise ValueError("demo task has no frozen primary")
+            envelope = seal_task_input(
+                InlineTaskInputV1(
+                    task,
+                    f"def {primary}(value: int) -> int:\n    raise NotImplementedError",
+                    TargetPreimageV1.none(),
+                ),
+                input_root=(input_parent / f"task-{index + 1}").absolute(),
+            )
+            outcome = solve(
+                envelope,
+                mode=mode,
+                model=model,
+                retrieval=local_retrieval,
+                cfg=config,
+                journal=repository,
+                acceptance=repository,
+                operation_key=f"demo-{mode.value}-{index + 1}",
+            )
+            outcomes.append(outcome)
+            if index == 0 and mode is ArmMode.WARM and outcome.passed and after_first is not None:
+                after_first()
 
     branches = [outcome.branch.value for outcome in outcomes]
     stages = [[event.stage for event in outcome.cost_events] for outcome in outcomes]
@@ -384,22 +423,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         small_model=args.small_model or args.strong_model,
         artifact_log=model_events_path,
     )
+    # This compatibility CLI now uses the same authoritative local SQLite
+    # retrieval as the canonical pipeline.  Optional EverOS is exercised only
+    # by the explicit ContextMesh/EverOS route, never as a demo prerequisite.
     after_first_callback: Callable[[], None] | None = None
-    if mode is ArmMode.COLD:
-        retrieval: RetrievalPort = NullRetrieval()
-    else:
-        client = EverOSClient(args.everos_url)
-        warm_retrieval = EverOSRetrieval(
-            SQLiteTemplateStore(args.output.parent / "templates.sqlite"), client
-        )
-        retrieval = warm_retrieval
-
-        def wait_after_first() -> None:
-            if warm_retrieval.last_stored_ref is None:
-                raise RuntimeError("WARM first task passed without storing a template")
-            client.wait_for_index()
-
-        after_first_callback = wait_after_first
+    retrieval = None
 
     evidence = run_demo_arm(
         round_id=args.round_id,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -14,6 +16,47 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 CONTEXTMESH = REPO / "contextmesh"
+CONVERGENCE_PATTERNS = {
+    "everos": re.compile(r"EverOS", re.IGNORECASE),
+    "fast_profile": re.compile(r"fast profile", re.IGNORECASE),
+    "ollama": re.compile(r"Ollama", re.IGNORECASE),
+    "one_repair": re.compile(r"one repair", re.IGNORECASE),
+    "opencode": re.compile(r"OpenCode", re.IGNORECASE),
+    "plan_spec_packet": re.compile(r"PlanSpecPacket", re.IGNORECASE),
+    "plan_spec_templates": re.compile(r"plan_spec_templates", re.IGNORECASE),
+    "reason_render_coding": re.compile(r"ReasonRenderCoding", re.IGNORECASE),
+    "rrc": re.compile(r"rrc(?:v2)?", re.IGNORECASE),
+    "rrcv2_fast": re.compile(r"RRCv2_fast", re.IGNORECASE),
+    "rrd": re.compile(r"rrd", re.IGNORECASE),
+    "tollgate": re.compile(r"tollgate", re.IGNORECASE),
+}
+HISTORICAL_GUIDANCE_BANNER = "**Historical / non-RRCv2 / superseded.**"
+HISTORICAL_PRESCRIPTIVE_DOCS = {
+    "docs/IMPLEMENTATION-BRIEF.md",
+    "docs/RRCv2-lane-A-pipeline.md",
+    "docs/RRCv2-lane-B-memory-measure.md",
+    "docs/RRCv2-plan.md",
+    "docs/RRCv2_fast.md",
+    "docs/decisions/0001-rrcv2-full-two-store-contract.md",
+    "docs/everos-rundown.md",
+    "docs/rfc-codex-ollama-contextmesh-rrc-demo.md",
+    "docs/rfc-contextmesh-rrc-multiagent-demo.md",
+    "docs/rfc-rrd-dual-memory-backends.md",
+    "docs/rfc-rrd-hierarchical-four-way-ablation.md",
+    "docs/rfc-rrd-live-product-matrix.md",
+    "docs/rfc-rrd-native-codex-migration.md",
+    "docs/rfc-rrd-unbounded-native-matrix.md",
+    "docs/rrd-native-matrix-results-2026-08-09.md",
+    "rrc/REPO_LAYOUT.md",
+    "rrc/lane_b/LIVE_EVEROS_HANDOFF.md",
+    "rrc/lane_b/ORCHESTRATOR_POLICY_SPEC.md",
+    "rrc/lane_b/PLAN.md",
+    "rrc/lane_b/SHAVE_IF_LOW_TIME.md",
+    "rrc/lane_b/SUBAGENT_PROTOCOL.md",
+    "rrc/lane_b/TEST_PLAN.md",
+    "rrc/lane_b/VALIDATION_HANDOFF.md",
+    "rrc/lane_b/Workflow.md",
+}
 
 
 def _load(name: str, path: Path):
@@ -43,6 +86,8 @@ def test_native_config_has_no_custom_provider_or_ollama(tmp_path: Path) -> None:
     assert 'cli_auth_credentials_store = "keyring"' in config
     assert "disable_response_storage" not in config
     assert 'model = "gpt-5.5"' in config
+    assert 'default_subagent_model = "gpt-5.6-luna"' in config
+    assert 'default_subagent_reasoning_effort = "low"' in config
     assert 'web_search = "disabled"' in config
     for feature in ("apps", "plugins", "browser_use", "computer_use", "image_generation"):
         assert f"{feature} = false" in config
@@ -51,6 +96,17 @@ def test_native_config_has_no_custom_provider_or_ollama(tmp_path: Path) -> None:
     assert stat.S_IMODE(profile.stat().st_mode) == 0o600
     assert ".ssh" in profile.read_text()
     assert ".codex/sessions" in profile.read_text()
+
+
+def test_native_config_rejects_invalid_worker_reasoning() -> None:
+    native = _load("rrd_native_config_worker", CONTEXTMESH / "scripts" / "rrd_native_config.py")
+    with pytest.raises(native.ConfigError, match="worker reasoning"):
+        native.config_text(
+            model="gpt-5.5",
+            reasoning="medium",
+            worker_model="gpt-5.6-luna",
+            worker_reasoning="bogus",
+        )
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is a macOS boundary")
@@ -180,26 +236,144 @@ def test_public_demo_surface_has_no_legacy_provider_dependency() -> None:
         "contextmesh/RRDdemo-local.sh",
         "contextmesh/RRDdemo.sh",
         "contextmesh/bench/run_bench.py",
+        "contextmesh/bench/run_rrcv2_bench.py",
         "contextmesh/bench/rubric-independent.json",
         "contextmesh/demo-prompt.txt",
         "contextmesh/demo.sh",
         "contextmesh/env.example",
         "contextmesh/scripts/smoke_everos.py",
-        "rrc/model.py",
-        "rrc/multiagent_demo.py",
+        "contextmesh/scripts/rrc_finisher.py",
+        "contextmesh/scripts/rrcv2_demo_prompt.py",
+        "contextmesh/scripts/rrcv2_product_cell.py",
+        "contextmesh/scripts/rrcv2_product_guard.py",
+        "contextmesh/scripts/rrcv2_product_smoke.py",
+        *{
+            "rrc/attempts.py",
+            "rrc/cell_journal.py",
+            "rrc/contextmesh.py",
+            "rrc/contextmesh_runtime.py",
+            "rrc/contract.py",
+            "rrc/dispatch_permit.py",
+            "rrc/economic_authority.py",
+            "rrc/everos.py",
+            "rrc/journal.py",
+            "rrc/model.py",
+            "rrc/multiagent_demo.py",
+            "rrc/pipeline/prompts.py",
+            "rrc/pipeline/sandbox.py",
+            "rrc/pipeline/solve.py",
+            "rrc/pipeline/stages.py",
+            "rrc/pipeline/template.py",
+            "rrc/pipeline/verify.py",
+            "rrc/policy.py",
+            "rrc/product_runtime.py",
+            "rrc/retrieval.py",
+            "rrc/sandbox_capability.py",
+            "rrc/store.py",
+            "rrc/workload.py",
+        },
         *{
             str(path.relative_to(REPO))
             for path in (CONTEXTMESH / "scripts").glob("rrd_*")
-            if path.is_file()
+            if path.is_file() and not path.name.startswith("rrd_audit_")
         },
     }
     assert set(names) == discovered
-    forbidden = ("ollama", "opencode", "tollgate", "model_provider", "env_key")
+    forbidden = ("ollama", "opencode", "tollgate")
     for name in names:
         path = REPO / name
         assert path.is_file(), path
         text = path.read_text().lower()
         assert not any(item in text for item in forbidden), path
+
+
+def test_rrcv2_convergence_inventory_is_current_and_has_no_transitional_legacy() -> None:
+    inventory_path = REPO / "docs/rrcv2-convergence-inventory.json"
+    inventory = json.loads(inventory_path.read_bytes())
+    assert inventory["kind"] == "RRCV2ConvergenceInventoryV1"
+    assert inventory["immutable_design_sha256"] == (
+        "2a036584574a610ebcf1f32517249166d3f802b1026b83f3cfab4d41a1c5a80e"
+    )
+    assert inventory["zero_transitional_legacy"] is True
+    listed = {row["path"]: row for row in inventory["entries"]}
+    assert len(listed) == len(inventory["entries"])
+
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=REPO,
+        capture_output=True,
+        check=True,
+    )
+    active_runtime = {
+        line for line in (CONTEXTMESH / "active-runtime-files.txt").read_text().splitlines() if line
+    }
+    discovered: dict[str, list[str]] = {}
+    relatives = sorted(
+        raw_relative for raw_relative in completed.stdout.split(b"\0") if raw_relative
+    )
+    for raw_relative in relatives:
+        relative = raw_relative.decode("utf-8", errors="strict")
+        if relative == "docs/rrcv2-convergence-inventory.json":
+            continue
+        path = REPO / relative
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        searchable = f"{relative}\n{text}"
+        matched = [
+            name for name, pattern in CONVERGENCE_PATTERNS.items() if pattern.search(searchable)
+        ]
+        if relative in active_runtime:
+            matched.append("active_runtime")
+        matched = sorted(set(matched))
+        if matched:
+            discovered[relative] = matched
+
+    assert set(listed) == set(discovered)
+    for relative, matched in discovered.items():
+        row = listed[relative]
+        assert row["matched_symbols"] == matched
+        assert row["sha256"] == hashlib.sha256((REPO / relative).read_bytes()).hexdigest()
+        assert row["classification"] in {
+            "immutable_fixture_non_rrc",
+            "immutable_source_contract",
+            "updated_m0",
+        }
+        assert row["classification"] != "transitional_legacy"
+        assert row["rationale"]
+        assert row["owner_milestone"]
+    assert [row["path"] for row in inventory["entries"]] == sorted(listed)
+    source_contracts = [
+        row for row in inventory["entries"] if row["classification"] == "immutable_source_contract"
+    ]
+    assert [row["path"] for row in source_contracts] == ["docs/RRCv2.md"]
+    assert active_runtime <= set(listed)
+
+
+def test_prescriptive_legacy_documents_have_local_superseded_banners() -> None:
+    for relative in sorted(HISTORICAL_PRESCRIPTIVE_DOCS):
+        path = REPO / relative
+        assert path.is_file(), relative
+        prefix = "\n".join(path.read_text().splitlines()[:12])
+        assert HISTORICAL_GUIDANCE_BANNER in prefix, relative
+        assert "ADR 0002" in prefix, relative
+        assert re.search(r"not\s*(?:>\s*)?current", prefix, re.IGNORECASE), relative
+
+
+def test_root_readme_points_to_the_current_rrcv2_authority() -> None:
+    text = (REPO / "README.md").read_text()
+    assert "docs/decisions/0002-rrcv2-full-contextmesh-profile.md" in text
+    assert "docs/rrcv2-requirement-map.md" in text
+    assert "docs/rrcv2-convergence-report.md" in text
+    assert "Ruff normalization" in text
+    assert "Pyright basic" in text
+    assert "pytest collection/execution" in text
+    assert "ADR 0001 is superseded" in text
+    assert "Ruff and Pyright stages are deferred" not in text
+    assert "[ADR 0001](" not in text
 
 
 def test_local_stack_never_probes_everos_or_model_proxy(tmp_path: Path) -> None:

@@ -1,0 +1,8 @@
+Audit the HTTP handlers in this repository for input-validation, authorization, and error-handling bugs. The exact files are src/handlers/orders.js, src/handlers/products.js, src/handlers/reviews.js, and src/handlers/users.js. Do not read or inspect source files in the root session. Immediately spawn ONE worker subagent per listed handler using the native Codex collaboration tool with agent_type="worker" and fork_context=false, launch all four workers before waiting, and give each worker exactly one handler. Each worker must fully inspect its assigned handler and the supplied current contents of src/models.js, src/utils.js, and src/middleware.js. Wait until all four workers finish, then merge their reports without adding unsupported claims.
+
+The final report must use only this grammar, grouped in handler-path order:
+
+## src/handlers/<name>.js
+- <critical|high|medium|low> | src/handlers/<name>.js:<positive line or range> | <one indivisible sentence describing one concrete bug>
+
+Use one bullet per claim. Do not add prose, tables, summaries, recommendations, or claims without a concrete file:line citation. If a handler has no supported finding, emit its heading with no bullets.

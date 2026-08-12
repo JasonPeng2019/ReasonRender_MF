@@ -1,5 +1,9 @@
 # EverOS — Repository Rundown
 
+> **Historical / non-RRCv2 / superseded.** This research snapshot is retained only for
+> reproducibility; it is not current RRCv2 product guidance. ADR 0002 makes EverOS an optional index
+> adapter, and `docs/RRCv2.md` governs the active algorithm.
+
 > `EverMind-AI/EverOS` — "One portable memory layer for every AI agent: local-first, Markdown-native, user-owned, and self-evolving across apps, tools, and workflows."
 >
 > Sources: the repo README, the EverOS product site, EverMind's public-beta announcement, and independent write-ups (MarkTechPost, DeepWiki, encorp.ai). Performance figures are vendor-reported unless noted.

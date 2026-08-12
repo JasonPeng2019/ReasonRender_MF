@@ -11,7 +11,7 @@ def test_spec_stage_is_strict_single_shot_metered_and_hides_oracle() -> None:
     hidden_oracle = "def test_secret(): assert False"
     task = make_task(oracle_tests=hidden_oracle)
     model = FakeModel({"spec": [fake_completion(spec_json(), model="strong-fake", tokens=7)]})
-    specification, event = spec_stage(task, model, RunContext("cold", task.task_id))
+    specification, event = spec_stage(task, model, RunContext("cold", task.task_id, "owner"))
     assert specification == make_spec()
     assert len(model.calls) == 1
     assert model.calls[0][0] is ModelRole.STRONG
@@ -20,11 +20,7 @@ def test_spec_stage_is_strict_single_shot_metered_and_hides_oracle() -> None:
         phrase in model.calls[0][1]
         for phrase in ("Do not run commands", "edit files", "or explain")
     )
-    assert "MUST be exactly one of the concrete values in RRC_SLOT_VALUES" in model.calls[0][1]
-    assert (
-        "Do not add parameter names, annotations, generic labels, or test literals"
-        in model.calls[0][1]
-    )
+    assert "controller bindings, not a Spec field" in model.calls[0][1]
     assert "slots.identifiers contains only function/identifier slot values" in model.calls[0][1]
     assert "Tests must be self-contained" in model.calls[0][1]
     assert event.stage == "spec"
@@ -45,7 +41,7 @@ def test_parse_spec_rejects_duplicate_unknown_and_wrong_nested_fields() -> None:
     unknown["unknown"] = True
     assert parse_spec(json.dumps(unknown), task) is None
     wrong = json.loads(spec_json())
-    wrong["slots"]["values"]["field"] = "wrong"
+    wrong["slots"]["values"] = {"field": "wrong"}
     assert parse_spec(json.dumps(wrong), task) is None
     duplicate_tests = json.loads(spec_json())
     duplicate_tests["tests"] = [" test ", "test"]
@@ -67,7 +63,7 @@ def test_parse_spec_rejects_duplicate_unknown_and_wrong_nested_fields() -> None:
 
 def test_implement_and_repair_each_make_one_small_model_call() -> None:
     model = FakeModel({"implement": ["bad"], "repair": ["fixed"]})
-    ctx = RunContext("cold", "t")
+    ctx = RunContext("cold", "t", "owner")
     code, first = implement_stage(make_spec(), model, ctx)
     fixed, second = repair_stage(make_spec(), code, "failed", model, ctx)
     assert (code, fixed) == ("bad", "fixed")

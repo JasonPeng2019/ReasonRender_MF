@@ -1,484 +1,289 @@
-import importlib
-from dataclasses import replace
+from __future__ import annotations
 
-import pytest
-from rrc.contract import (
-    ArmMode,
-    BranchDecision,
-    Candidate,
-    Config,
-    ModelRole,
-    StoreFailure,
-    Task,
-    Template,
-)
-from rrc.pipeline import solve
-from rrc.pipeline.stubs import FakeModel, InMemoryRetrieval
-from rrc.pipeline.template import templatize
+import json
 
-from tests.pipeline.helpers import (
-    broken_implementation,
-    implementation,
-    make_spec,
-    make_task,
-    spec_json,
-)
+from rrc.pipeline.solve import WorkerCandidateV1, parse_worker_candidate
 
 
-class ExplodingRetrieval(InMemoryRetrieval):
-    def retrieve(self, task: Task, cfg: Config):  # type: ignore[no-untyped-def]
-        raise AssertionError("cold arm retrieved")
-
-    def get_template(self, external_ref: str):  # type: ignore[no-untyped-def]
-        raise AssertionError("cold arm resolved")
-
-    def store(self, task: Task, template, outcome):  # type: ignore[no-untyped-def]
-        raise AssertionError("cold arm stored")
-
-
-def test_cold_direct_success_never_touches_retrieval_and_returns_template() -> None:
-    task = make_task(oracle_tests="def test_oracle(): assert get_order(4) == 4")
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    outcome = solve(
-        task,
-        mode=ArmMode.COLD,
-        model=model,
-        retrieval=ExplodingRetrieval(),
-        cfg=Config(),
+def test_worker_candidate_accepts_only_the_exact_attempt_and_path() -> None:
+    attempt = "1" * 64
+    raw = json.dumps(
+        {
+            "artifact_path": "solution.py",
+            "attempt_id": attempt,
+            "source": "def f() -> int:\n    return 1",
+            "v": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    assert outcome.passed is True
-    assert outcome.pass_at_1 is True
-    assert outcome.arm == "cold"
-    assert outcome.branch is BranchDecision.MISS
-    assert outcome.repairs == 0
-    assert outcome.escalated is False
-    assert outcome.code == implementation()
-    assert outcome.template is not None
-    assert [event.stage for event in outcome.cost_events] == ["spec", "implement"]
-    assert [call[0] for call in model.calls] == [ModelRole.STRONG, ModelRole.SMALL]
+    candidate = parse_worker_candidate(raw, attempt_id=attempt, artifact_path="solution.py")
+    assert isinstance(candidate, WorkerCandidateV1)
+    assert candidate.kind == "code"
+    assert candidate.artifact is not None
 
 
-@pytest.mark.parametrize(
-    ("cap", "stages", "passed"),
-    [(9, ["spec", "implement", "repair"], True), (0, ["spec", "implement"], False)],
-)
-def test_fresh_miss_honors_zero_or_one_repair(cap: int, stages: list[str], passed: bool) -> None:
-    responses: dict[str, list[str]] = {
-        "spec": [spec_json()],
-        "implement": [broken_implementation()],
-        "repair": [implementation()],
-    }
-    retrieval = InMemoryRetrieval()
-    outcome = solve(
-        make_task(),
-        mode=ArmMode.WARM,
-        model=FakeModel(responses),
-        retrieval=retrieval,
-        cfg=Config(repair_cap_N=cap),
+def test_worker_candidate_path_substitution_is_typed_invalid() -> None:
+    attempt = "1" * 64
+    raw = json.dumps(
+        {
+            "artifact_path": "other.py",
+            "attempt_id": attempt,
+            "source": "pass",
+            "v": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    assert outcome.passed is passed
-    assert [event.stage for event in outcome.cost_events] == stages
-    assert outcome.repairs == int(cap > 0)
-    assert outcome.template is not None if passed else outcome.template is None
-    assert retrieval.store_calls == int(passed)
-    assert outcome.branch is BranchDecision.MISS
-    assert outcome.escalated is False
-    assert retrieval.retrieve_calls == 1
-    assert retrieval.get_calls == 0
+    candidate = parse_worker_candidate(raw, attempt_id=attempt, artifact_path="solution.py")
+    assert candidate.kind == "invalid_candidate"
+    assert candidate.reason == "artifact_path_mismatch"
 
 
-@pytest.mark.parametrize(
-    ("cap", "stages"),
-    [(1, ["spec", "implement", "repair"]), (0, ["spec", "implement"])],
-)
-def test_cold_final_failures_honor_cap_and_never_touch_retrieval(
-    cap: int, stages: list[str]
+def test_worker_candidate_malformed_and_oversize_are_bounded_invalids() -> None:
+    attempt = "1" * 64
+    malformed = parse_worker_candidate("not json", attempt_id=attempt, artifact_path="solution.py")
+    oversized = parse_worker_candidate(
+        b"x" * (2 * 1024 * 1024 + 1),
+        attempt_id=attempt,
+        artifact_path="solution.py",
+    )
+    assert (malformed.kind, malformed.reason, malformed.observed_utf8_bytes) == (
+        "invalid_candidate",
+        "malformed_json",
+        8,
+    )
+    assert (oversized.kind, oversized.reason, oversized.observed_utf8_bytes) == (
+        "invalid_candidate",
+        "oversize",
+        2 * 1024 * 1024 + 1,
+    )
+
+
+def test_warm_sequence_preserves_exact_render_rejection_before_fresh_miss(
+    tmp_path, monkeypatch
 ) -> None:
-    responses = {
-        "spec": [spec_json()],
-        "implement": [broken_implementation()],
-        "repair": [broken_implementation().replace("-1", "-2")],
-    }
-    outcome = solve(
-        make_task(oracle_tests="def test_oracle(): assert get_order(1) == 1"),
-        mode=ArmMode.COLD,
-        model=FakeModel(responses),
-        retrieval=ExplodingRetrieval(),
-        cfg=Config(repair_cap_N=cap),
+    """The M6 credibility sequence is MISS -> REUSE -> exact reject -> fresh MISS."""
+
+    import hashlib
+    import re
+    from collections.abc import Callable
+
+    import rrc.pipeline.solve as solve_module
+    from rrc.contract import (
+        ArmMode,
+        BranchDecision,
+        Completion,
+        Config,
+        InlineTaskInputV1,
+        ModelRole,
+        Slots,
+        Spec,
+        StructuralShapeV1,
+        TargetPreimageV1,
+        Task,
+        Usage,
+        seal_task_input,
     )
-    assert outcome.passed is False
-    assert outcome.pass_at_1 is False
-    assert outcome.repairs == cap
-    assert outcome.template is None
-    assert [event.stage for event in outcome.cost_events] == stages
-
-
-def test_cold_repair_success_returns_repaired_final_code() -> None:
-    oracle = "def test_oracle(): assert get_order(5) == 5"
-    model = FakeModel(
-        {
-            "spec": [spec_json()],
-            "implement": [broken_implementation()],
-            "repair": [implementation()],
-        }
+    from rrc.journal import SQLiteRRCRepository
+    from rrc.pipeline.solve import solve
+    from rrc.pipeline.verify import (
+        CodeArtifactV1,
+        VerificationResultV1,
+        VerificationRunV1,
+        VerificationTierRowV1,
+        code_artifact_bytes,
     )
-    outcome = solve(
-        make_task(oracle_tests=oracle),
-        mode=ArmMode.COLD,
-        model=model,
-        retrieval=ExplodingRetrieval(),
-        cfg=Config(),
-    )
-    assert outcome.code == implementation()
-    assert outcome.passed is True
-    assert outcome.pass_at_1 is True
-    assert outcome.repairs == 1
-    assert outcome.escalated is False
-    assert outcome.template is not None
-    assert [event.stage for event in outcome.cost_events] == ["spec", "implement", "repair"]
-    assert all(oracle not in call[1] for call in model.calls)
+    from rrc.retrieval import SQLiteHybridRetrieval
 
-
-def test_cold_verifier_timeout_becomes_failed_final_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    solve_module = importlib.import_module("rrc.pipeline.solve")
-
-    def timeout_result(
-        code: str,
-        tests: str | tuple[str, ...],
-        timeout: float = 15,
-    ) -> tuple[bool, str]:
-        return False, f"pytest timed out after {timeout:g} seconds"
-
-    monkeypatch.setattr(solve_module, "run_pytest", timeout_result)
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    outcome = solve(
-        make_task(),
-        mode=ArmMode.COLD,
-        model=model,
-        retrieval=ExplodingRetrieval(),
-        cfg=Config(repair_cap_N=0),
-    )
-    assert outcome.code == implementation()
-    assert outcome.passed is False
-    assert outcome.pass_at_1 is None
-    assert outcome.template is None
-    assert [event.stage for event in outcome.cost_events] == ["spec", "implement"]
-
-
-def test_invalid_modes_and_negative_caps_fail_before_any_port_call() -> None:
-    model = FakeModel({})
-    retrieval = InMemoryRetrieval()
-    with pytest.raises(ValueError):
-        solve(
-            make_task(),
-            mode=ArmMode.BASELINE,
-            model=model,
-            retrieval=retrieval,
-            cfg=Config(),
+    def verification(*, attempt_id, task, source, tests, specification):
+        del tests, specification
+        artifact = CodeArtifactV1(attempt_id, task.artifact_path, source)
+        artifact_sha = hashlib.sha256(code_artifact_bytes(artifact)).hexdigest()
+        rows = tuple(
+            VerificationTierRowV1(
+                name,
+                "passed",
+                artifact_sha,
+                hashlib.sha256(b"passed\n").hexdigest(),
+                hashlib.sha256(b"").hexdigest(),
+            )
+            for name in ("assembly", "ruff", "pyright", "pytest")
         )
-    with pytest.raises(ValueError):
-        solve(
-            make_task(),
-            mode=ArmMode.WARM,
-            model=model,
-            retrieval=retrieval,
-            cfg=Config(repair_cap_N=-1),
+        return VerificationRunV1(
+            VerificationResultV1(attempt_id, task.verification_profile, artifact_sha, rows, True),
+            artifact,
+            (),
         )
-    assert model.calls == []
-    assert retrieval.retrieve_calls == retrieval.get_calls == retrieval.store_calls == 0
 
+    monkeypatch.setattr(solve_module, "_run_verifier", verification)
+    monkeypatch.setattr(solve_module, "_score_hidden_oracle", lambda **_: True)
 
-def test_malformed_initial_spec_returns_empty_final_code_and_only_spec_cost() -> None:
-    outcome = solve(
-        make_task(oracle_tests="def test_oracle(): assert False"),
-        mode=ArmMode.COLD,
-        model=FakeModel({"spec": ["not json"]}),
-        retrieval=ExplodingRetrieval(),
-        cfg=Config(),
-    )
-    assert outcome.code == ""
-    assert outcome.passed is False
-    assert outcome.pass_at_1 is False
-    assert outcome.template is None
-    assert [event.stage for event in outcome.cost_events] == ["spec"]
+    class Model:
+        provider = "fake"
 
+        def __init__(self, responses: dict[str, list[str | Callable[[str], str]]]) -> None:
+            self.responses = {key: list(value) for key, value in responses.items()}
+            self.calls: list[tuple[ModelRole, str]] = []
 
-def test_warm_exact_reuse_has_no_spec_cost_and_stores_once() -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    model = FakeModel({"implement": [implementation()]})
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.branch is BranchDecision.REUSE
-    assert outcome.passed is True
-    assert outcome.repairs == 0
-    assert outcome.escalated is False
-    assert outcome.template is template
-    assert [event.stage for event in outcome.cost_events] == ["implement"]
-    assert (retrieval.retrieve_calls, retrieval.get_calls, retrieval.store_calls) == (1, 1, 1)
-    assert len(model.calls) == 1
+        def complete(self, role, prompt, ctx, stage):
+            del ctx
+            self.calls.append((role, stage))
+            response = self.responses[stage].pop(0)
+            text = response(prompt) if callable(response) else response
+            return Completion(text, Usage(1, 1, 2), "fake-model")
 
+    def code(source: str) -> Callable[[str], str]:
+        def response(prompt: str) -> str:
+            match = re.search(
+                r"attempt_id and artifact_path must be exactly '([0-9a-f]{64})' and '([^']+)'",
+                prompt,
+            )
+            assert match is not None
+            return json.dumps(
+                {
+                    "artifact_path": match.group(2),
+                    "attempt_id": match.group(1),
+                    "source": source,
+                    "v": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
 
-def test_reuse_repair_success_does_not_escalate() -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    model = FakeModel({"implement": [broken_implementation()], "repair": [implementation()]})
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.passed is True
-    assert outcome.repairs == 1
-    assert outcome.escalated is False
-    assert [event.stage for event in outcome.cost_events] == ["implement", "repair"]
-    assert retrieval.store_calls == 1
+        return response
 
-
-@pytest.mark.parametrize(
-    ("cap", "expected"),
-    [
-        (1, ["implement", "repair", "fallback_spec", "fallback_implement"]),
-        (0, ["implement", "fallback_spec", "fallback_implement"]),
-    ],
-)
-def test_failed_reuse_repairs_if_allowed_then_falls_back_once(
-    cap: int, expected: list[str]
-) -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    responses = {
-        "implement": [broken_implementation()],
-        "repair": [broken_implementation()],
-        "fallback_spec": [spec_json()],
-        "fallback_implement": [implementation()],
-    }
-    oracle = "def test_oracle(): assert get_order(7) == 7"
-    task = make_task(oracle_tests=oracle)
-    model = FakeModel(responses)
-    outcome = solve(
-        task,
-        mode=ArmMode.WARM,
-        model=model,
-        retrieval=retrieval,
-        cfg=Config(repair_cap_N=cap),
-    )
-    assert outcome.passed is True
-    assert outcome.branch is BranchDecision.REUSE
-    assert outcome.escalated is True
-    assert outcome.repairs == int(cap > 0)
-    assert outcome.pass_at_1 is True
-    assert [event.stage for event in outcome.cost_events] == expected
-    expected_roles = [ModelRole.SMALL]
-    if cap:
-        expected_roles.append(ModelRole.SMALL)
-    expected_roles.extend((ModelRole.STRONG, ModelRole.SMALL))
-    assert [call[0] for call in model.calls] == expected_roles
-    assert all(oracle not in call[1] for call in model.calls)
-    assert all(
-        (event.arm, event.task_id, event.provider, event.model, event.usage.total_tokens)
-        == ("warm", task.task_id, "fake", "fake", 1)
-        for event in outcome.cost_events
-    )
-    assert retrieval.store_calls == 1
-
-
-def test_cap_zero_malformed_fallback_retains_initial_code() -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    initial = broken_implementation()
-    outcome = solve(
-        make_task(),
-        mode=ArmMode.WARM,
-        model=FakeModel({"implement": [initial], "fallback_spec": ["not json"]}),
-        retrieval=retrieval,
-        cfg=Config(repair_cap_N=0),
-    )
-    assert outcome.code == initial
-    assert outcome.repairs == 0
-    assert outcome.escalated is True
-    assert outcome.template is None
-    assert [event.stage for event in outcome.cost_events] == ["implement", "fallback_spec"]
-    assert retrieval.store_calls == 0
-
-
-def test_valid_fallback_implementation_failure_is_final_and_not_stored() -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    fallback_code = broken_implementation().replace("-1", "-3")
-    model = FakeModel(
-        {
-            "implement": [broken_implementation()],
-            "repair": [broken_implementation().replace("-1", "-2")],
-            "fallback_spec": [spec_json()],
-            "fallback_implement": [fallback_code],
-        }
-    )
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.code == fallback_code
-    assert outcome.passed is False
-    assert outcome.template is None
-    assert [event.stage for event in outcome.cost_events] == [
-        "implement",
-        "repair",
-        "fallback_spec",
-        "fallback_implement",
-    ]
-    assert retrieval.store_calls == 0
-
-
-def test_malformed_fallback_retains_last_reuse_code_and_does_not_store() -> None:
-    template = templatize(make_spec())
-    retrieval = InMemoryRetrieval({template.external_ref: template})
-    repaired = broken_implementation().replace("-1", "-2")
-    model = FakeModel(
-        {
-            "implement": [broken_implementation()],
-            "repair": [repaired],
-            "fallback_spec": ["not json"],
-        }
-    )
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.code == repaired
-    assert outcome.passed is False
-    assert outcome.template is None
-    assert retrieval.store_calls == 0
-    assert [event.stage for event in outcome.cost_events] == [
-        "implement",
-        "repair",
-        "fallback_spec",
-    ]
-
-
-def test_stale_or_structurally_wrong_candidate_becomes_fresh_miss() -> None:
-    template = templatize(make_spec())
-    corrupt = replace(template, external_ref="0" * 64)
-    retrieval = InMemoryRetrieval({corrupt.external_ref: corrupt})
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.branch is BranchDecision.MISS
-    assert [event.stage for event in outcome.cost_events] == ["spec", "implement"]
-
-
-def test_candidate_with_missing_own_store_row_becomes_fresh_miss() -> None:
-    class StaleRetrieval(InMemoryRetrieval):
-        def retrieve(self, task: Task, cfg: Config) -> list[Candidate]:
-            self.retrieve_calls += 1
-            return [Candidate("missing", 1.0)]
-
-    retrieval = StaleRetrieval()
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.branch is BranchDecision.MISS
-    assert outcome.passed is True
-    assert (retrieval.retrieve_calls, retrieval.get_calls, retrieval.store_calls) == (1, 1, 1)
-
-
-def test_malformed_nested_candidate_becomes_fresh_miss_without_escaping() -> None:
-    malformed = Template("bad", None, ("entity",))  # type: ignore[arg-type]
-    retrieval = InMemoryRetrieval({"bad": malformed})
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    outcome = solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert outcome.branch is BranchDecision.MISS
-    assert outcome.passed is True
-
-
-def test_store_error_wraps_the_exact_completed_outcome_and_cause() -> None:
-    cause = OSError("disk full")
-    retrieval = InMemoryRetrieval(store_error=cause)
-    model = FakeModel({"spec": [spec_json()], "implement": [implementation()]})
-    with pytest.raises(StoreFailure) as caught:
-        solve(make_task(), mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    assert caught.value.__cause__ is cause
-    assert caught.value.outcome.passed is True
-    assert [event.stage for event in caught.value.outcome.cost_events] == ["spec", "implement"]
-
-
-def test_store_error_after_direct_reuse_preserves_reuse_outcome() -> None:
-    template = templatize(make_spec())
-    cause = OSError("index unavailable")
-    retrieval = InMemoryRetrieval(
-        templates={template.external_ref: template},
-        store_error=cause,
-    )
-    with pytest.raises(StoreFailure) as caught:
-        solve(
-            make_task(),
-            mode=ArmMode.WARM,
-            model=FakeModel({"implement": [implementation()]}),
-            retrieval=retrieval,
-            cfg=Config(),
+    def envelope(name: str, primary: str, entity: str, starter: str, public: str, oracle: str):
+        task = Task(
+            f"rrcv2-cli-{name}-001",
+            (
+                f'Implement {primary} so it returns the entity label "{entity}". '
+                + "Preserve the zero-argument public API."
+            ),
+            family="entity_label",
+            artifact_path=f"rrcv2_demo/{name}.py",
+            public_tests=(public,),
+            oracle_tests=(oracle,),
+            verification_profile="rrcv2_general_v1",
+            primary=primary,
+            shape=StructuralShapeV1((), 0, ()),
+            slot_values=(("entity", entity),),
         )
-    outcome = caught.value.outcome
-    assert caught.value.__cause__ is cause
-    assert outcome.branch is BranchDecision.REUSE
-    assert outcome.passed is True
-    assert outcome.escalated is False
-    assert outcome.template is template
-    assert [event.stage for event in outcome.cost_events] == ["implement"]
-    assert (retrieval.retrieve_calls, retrieval.get_calls, retrieval.store_calls) == (1, 1, 1)
-
-
-def test_store_error_after_fallback_preserves_all_cost_events() -> None:
-    template = templatize(make_spec())
-    cause = OSError("index unavailable")
-    retrieval = InMemoryRetrieval(
-        templates={template.external_ref: template},
-        store_error=cause,
-    )
-    model = FakeModel(
-        {
-            "implement": [broken_implementation()],
-            "repair": [broken_implementation()],
-            "fallback_spec": [spec_json()],
-            "fallback_implement": [implementation()],
-        }
-    )
-    with pytest.raises(StoreFailure) as caught:
-        solve(
-            make_task(),
-            mode=ArmMode.WARM,
-            model=model,
-            retrieval=retrieval,
-            cfg=Config(),
+        return seal_task_input(
+            InlineTaskInputV1(task, starter, TargetPreimageV1.none()),
+            input_root=(tmp_path / f"input-{name}").resolve(),
         )
-    outcome = caught.value.outcome
-    assert caught.value.__cause__ is cause
-    assert outcome.branch is BranchDecision.REUSE
-    assert outcome.passed is True
-    assert outcome.repairs == 1
-    assert outcome.escalated is True
-    assert outcome.template is not None
-    assert [event.stage for event in outcome.cost_events] == [
-        "implement",
-        "repair",
-        "fallback_spec",
-        "fallback_implement",
-    ]
-    assert (retrieval.retrieve_calls, retrieval.get_calls, retrieval.store_calls) == (1, 1, 1)
 
-
-def test_two_task_stream_misses_then_reuses_same_template_without_spec() -> None:
-    first = make_task(oracle_tests="def test_oracle(): assert get_order(8) == 8")
-    second = make_task(
-        task_id="purchase-2",
-        entity="Purchase",
-        function="fetch_purchase",
-        field="key",
-        oracle_tests="def test_oracle(): assert fetch_purchase(8) == 8",
+    miss_spec = Spec(
+        "Implement the User label method.",
+        "class User:\n    def label(self) -> str: ...",
+        "User.label returns the string User.",
+        ('def test_label():\n    assert User().label() == "User"',),
+        Slots(entity="User"),
     )
-    retrieval = InMemoryRetrieval()
-    model = FakeModel(
-        {
-            "spec": [spec_json()],
-            "implement": [implementation(), implementation("fetch_purchase", "key")],
+    near_spec = Spec(
+        "Implement label_entity for order item.",
+        "def label_entity() -> str: ...",
+        "label_entity returns the string order item.",
+        ('def test_label_entity():\n    assert label_entity() == "order item"',),
+        Slots(entity="order item"),
+    )
+    independent_miss = json.dumps(
+        {"tests": ['def test_stable():\n    assert User().label() == "User"'], "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    independent_near = json.dumps(
+        {"tests": ['def test_stable():\n    assert label_entity() == "order item"'], "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    models = (
+        Model(
+            {
+                "spec": [json.dumps(miss_spec.as_json(), sort_keys=True, separators=(",", ":"))],
+                "independent_tests": [independent_miss],
+                "implement": [
+                    code('class User:\n    def label(self) -> str:\n        return "User"')
+                ],
+            }
+        ),
+        Model(
+            {
+                "implement": [
+                    code('class Product:\n    def label(self) -> str:\n        return "Product"')
+                ]
+            }
+        ),
+        Model(
+            {
+                "spec": [json.dumps(near_spec.as_json(), sort_keys=True, separators=(",", ":"))],
+                "independent_tests": [independent_near],
+                "implement": [code('def label_entity() -> str:\n    return "order item"')],
+            }
+        ),
+    )
+    envelopes = (
+        envelope(
+            "miss",
+            "User.label",
+            "User",
+            "class User:\n    def label(self) -> str:\n        raise NotImplementedError",
+            'def test_user_label():\n    assert User().label() == "User"',
+            'def test_user_label_stable():\n    assert User().label() == "User"',
+        ),
+        envelope(
+            "hit",
+            "Product.label",
+            "Product",
+            "class Product:\n    def label(self) -> str:\n        raise NotImplementedError",
+            'def test_product_label():\n    assert Product().label() == "Product"',
+            'def test_product_label_stable():\n    assert Product().label() == "Product"',
+        ),
+        envelope(
+            "near",
+            "label_entity",
+            "order item",
+            "def label_entity() -> str:\n    raise NotImplementedError",
+            'def test_label_entity():\n    assert label_entity() == "order item"',
+            'def test_label_entity_stable():\n    assert label_entity() == "order item"',
+        ),
+    )
+
+    with SQLiteRRCRepository(tmp_path / "rrcv2.sqlite3") as repository:
+        retrieval = SQLiteHybridRetrieval(repository)
+        outcomes = [
+            solve(
+                task_input,
+                mode=ArmMode.WARM,
+                model=model,
+                retrieval=retrieval,
+                cfg=Config("owner"),
+                journal=repository,
+                acceptance=repository,
+                operation_key=f"m6-{index}",
+            )
+            for index, (task_input, model) in enumerate(zip(envelopes, models, strict=True))
+        ]
+        assert [outcome.branch for outcome in outcomes] == [
+            BranchDecision.MISS,
+            BranchDecision.REUSE,
+            BranchDecision.MISS,
+        ]
+        assert all(outcome.passed for outcome in outcomes)
+        assert [[stage for _role, stage in model.calls] for model in models] == [
+            ["spec", "independent_tests", "implement"],
+            ["implement"],
+            ["spec", "independent_tests", "implement"],
+        ]
+        third_attempt = outcomes[2].cost_events[0].attempt_id
+        assert third_attempt is not None
+        stages = {
+            row[0]
+            for row in repository._connection.execute(  # noqa: SLF001
+                "SELECT stage FROM rrcv2_deterministic_steps WHERE attempt_id=?",
+                (third_attempt,),
+            )
         }
-    )
-    first_outcome = solve(first, mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config())
-    second_outcome = solve(
-        second, mode=ArmMode.WARM, model=model, retrieval=retrieval, cfg=Config()
-    )
-    assert first_outcome.branch is BranchDecision.MISS
-    assert second_outcome.branch is BranchDecision.REUSE
-    assert first_outcome.template == second_outcome.template
-    assert "spec" not in [event.stage for event in second_outcome.cost_events]
-    assert first_outcome.passed and second_outcome.passed
-    assert first_outcome.pass_at_1 and second_outcome.pass_at_1
-    assert retrieval.store_calls == 2
+        assert {"retrieval", "cache_render_rejection", "tier_minus_one"} <= stages
+        assert len([event for outcome in outcomes for event in outcome.cost_events]) == 7

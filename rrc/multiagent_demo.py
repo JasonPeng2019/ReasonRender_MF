@@ -447,6 +447,59 @@ def _credential_free_environment(env: Mapping[str, str] | None) -> dict[str, str
     return {name: value for name, value in env.items() if blocked.search(name) is None}
 
 
+def _planner_transcript_evidence(stdout: str, env: Mapping[str, str] | None) -> dict[str, object]:
+    identifiers: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("type") == "thread.started":
+            value = row.get("thread_id")
+            if isinstance(value, str) and value:
+                identifiers.append(value)
+    if len(set(identifiers)) != 1:
+        return {}
+    home_value = env.get("CODEX_HOME") if env is not None else None
+    if not isinstance(home_value, str) or not home_value:
+        return {}
+    thread_id = identifiers[0]
+    home = Path(home_value).resolve(strict=True)
+    matches = list((home / "sessions").rglob(f"*{thread_id}*.jsonl"))
+    if len(matches) != 1:
+        return {}
+    path = matches[0].resolve(strict=True)
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 100_000_000:
+        return {}
+    raw = path.read_bytes()
+    if len(raw) > 100_000_000:
+        return {}
+    model: str | None = None
+    reasoning: str | None = None
+    for line in raw.decode("utf-8").splitlines():
+        row = json.loads(line)
+        if not isinstance(row, dict) or row.get("type") != "turn_context":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        model_value = payload.get("model")
+        effort_value = payload.get("effort")
+        if isinstance(model_value, str) and isinstance(effort_value, str):
+            model = model_value
+            reasoning = effort_value
+    if model is None or reasoning is None:
+        return {}
+    return {
+        "thread_id": thread_id,
+        "transcript_path": str(path),
+        "transcript_sha256": hashlib.sha256(raw).hexdigest(),
+        "effective_model": model,
+        "effective_reasoning": reasoning,
+    }
+
+
 class CodexPacketPlanner:
     """One structured Codex planner completion with durable raw evidence."""
 
@@ -483,7 +536,6 @@ class CodexPacketPlanner:
             "features.multi_agent=false",
             "--json",
             "--ignore-rules",
-            "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
@@ -547,6 +599,16 @@ class CodexPacketPlanner:
             "stderr": result.stderr,
         }
         recovered_usage = _recover_codex_usage(result.stdout)
+        transcript_evidence = _planner_transcript_evidence(result.stdout, self._env)
+        if self._env and self._env.get("RRC_REQUIRE_EFFECTIVE_MODEL") == "1":
+            if not transcript_evidence:
+                raise RuntimeError("planner effective model transcript evidence is missing")
+            if transcript_evidence.get("effective_model") != (model or self._model):
+                raise RuntimeError("planner effective model does not match requested model")
+            expected_reasoning = self._env.get("RRD_CODEX_REASONING", "medium")
+            if transcript_evidence.get("effective_reasoning") != expected_reasoning:
+                raise RuntimeError("planner effective reasoning does not match requested reasoning")
+        base_event.update(transcript_evidence)
         if recovered_usage is not None:
             base_event["usage"] = recovered_usage
         if result.returncode != 0:

@@ -1,5 +1,9 @@
 # Lane B Implementation Plan
 
+> **Historical / non-RRCv2 / superseded.** This plan is retained only for reproducibility; it is not
+> current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> reduced or required-EverOS route below is fixture-only/non-product.
+
 **Build timer started:** 2026-08-07 12:29:11 -07:00
 
 ## Goal

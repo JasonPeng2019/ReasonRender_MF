@@ -1,5 +1,9 @@
 # Lane B Workflow
 
+> **Historical / non-RRCv2 / superseded.** This workflow is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> old coding-agent topology below is fixture-only/non-product.
+
 ## Coding topology — not the product runtime
 
 Use one expensive **coding orchestrator** and a fresh `luna-xhigh-fast`

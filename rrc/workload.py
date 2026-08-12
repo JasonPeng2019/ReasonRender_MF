@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import json
 
-from rrc.contract import Task
+from rrc.contract import StructuralShapeV1, Task
 
 
 def _fixed_return_task(task_id: str, function: str, number: int) -> Task:
     shape = json.dumps(
         {"arity": 1, "arg_types": ["int"], "fields": []},
+        sort_keys=True,
         separators=(",", ":"),
     )
     values = json.dumps(
         {"function": function, "number": str(number)},
+        sort_keys=True,
         separators=(",", ":"),
     )
     return Task(
@@ -22,7 +24,13 @@ def _fixed_return_task(task_id: str, function: str, number: int) -> Task:
             f"Implement {function}(value: int) -> int and always return {number}.\n"
             f"RRC_SHAPE: {shape}\nRRC_SLOT_VALUES: {values}"
         ),
-        oracle_tests=f"def test_oracle(): assert {function}(99) == {number}",
+        oracle_tests=(f"def test_oracle(): assert {function}(99) == {number}",),
+        family="fixed-return",
+        searchable_public=True,
+        verification_profile="rrcv2_synthetic_v1",
+        primary=function,
+        shape=StructuralShapeV1(("int",), 1, ()),
+        slot_values=(("function", function), ("number", str(number))),
     )
 
 

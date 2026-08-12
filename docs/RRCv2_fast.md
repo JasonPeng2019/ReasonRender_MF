@@ -1,5 +1,9 @@
 # RRCv2 Fast
 
+> **Historical / non-RRCv2 / superseded.** This record is retained only for reproducibility; it is
+> not current product guidance. ADR 0002 and `docs/RRCv2.md` govern the active implementation. The
+> reduced fast profile below is fixture-only/non-product.
+
 ## What this version is for
 
 RRCv2 Fast is the smallest RRCv2 implementation that can prove the product
