@@ -365,6 +365,15 @@ class DockerSupervisorPort(Protocol):
     def attest_image(self, authority: dict[str, object], seccomp_path: Path) -> None: ...
 
 
+def _docker_binary() -> str:
+    if os.environ.get("RRCV2_PRODUCT_SMOKE") != "1":
+        return "docker"
+    value = os.environ.get("RRCV2_DOCKER_BIN", "")
+    if not value.startswith("/") or Path(value).name != "docker":
+        raise SandboxUnavailable("product Docker executable authority is missing")
+    return value
+
+
 def _docker_env() -> dict[str, str]:
     home = os.environ.get("HOME")
     if not home:
@@ -559,7 +568,7 @@ class SubprocessDockerSupervisor:
     def _require_absent(self, name: str) -> None:
         try:
             result = subprocess.run(
-                ("docker", "--context", DOCKER_CONTEXT, "inspect", name),
+                (_docker_binary(), "--context", DOCKER_CONTEXT, "inspect", name),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -652,7 +661,7 @@ class SubprocessDockerSupervisor:
         try:
             result = subprocess.run(
                 (
-                    "docker",
+                    _docker_binary(),
                     "--context",
                     DOCKER_CONTEXT,
                     "image",
@@ -692,7 +701,7 @@ class SubprocessDockerSupervisor:
         name = f"rrcv2-attest-{uuid.uuid4().hex}"
         frozen = SandboxLimits()
         argv = (
-            "docker",
+            _docker_binary(),
             "--context",
             DOCKER_CONTEXT,
             "run",
@@ -1171,7 +1180,7 @@ def _backend_identity_snapshot(repo: Path) -> bytes:
     if _sha(version_raw) != docker.get("colima_version_sha256"):
         raise SandboxUnavailable("owned Colima executable version drifted")
     info_raw = _bounded_backend_command(
-        ("docker", "--context", DOCKER_CONTEXT, "info", "--format", "{{json .}}"),
+        (_docker_binary(), "--context", DOCKER_CONTEXT, "info", "--format", "{{json .}}"),
         timeout=30,
     )
     if not _is_hex64(docker.get("docker_info_sha256")):
@@ -1717,7 +1726,7 @@ def _docker_control(*argv: str, timeout: int = 30) -> bytes:
             adjusted = (adjusted[0], *label, *adjusted[1:])
     try:
         result = subprocess.run(
-            ("docker", "--context", DOCKER_CONTEXT, *adjusted),
+            (_docker_binary(), "--context", DOCKER_CONTEXT, *adjusted),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1740,7 +1749,7 @@ def _docker_remove_owned(kind: Literal["container", "volume"], name: str) -> Non
     inspect_argv = ("inspect", name) if kind == "container" else ("volume", "inspect", name)
     try:
         result = subprocess.run(
-            ("docker", "--context", DOCKER_CONTEXT, *remove_argv),
+            (_docker_binary(), "--context", DOCKER_CONTEXT, *remove_argv),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1749,7 +1758,7 @@ def _docker_remove_owned(kind: Literal["container", "volume"], name: str) -> Non
             check=False,
         )
         inspect = subprocess.run(
-            ("docker", "--context", DOCKER_CONTEXT, *inspect_argv),
+            (_docker_binary(), "--context", DOCKER_CONTEXT, *inspect_argv),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1959,7 +1968,7 @@ class SealedDockerSandbox:
         pids = frozen.trusted_tool_pids if trusted else frozen.untrusted_pids
         output_mode = "" if output_writable else ",readonly"
         return (
-            "docker",
+            _docker_binary(),
             "--context",
             DOCKER_CONTEXT,
             "run",

@@ -168,6 +168,7 @@ def test_codex_model_uses_empty_stage_cwd_stdin_and_frozen_zero_tool_flags(
                     "usage": {
                         "input_tokens": 2,
                         "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
                         "output_tokens": 1,
                         "reasoning_output_tokens": 0,
                     },

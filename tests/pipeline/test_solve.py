@@ -287,3 +287,11 @@ def test_warm_sequence_preserves_exact_render_rejection_before_fresh_miss(
         }
         assert {"retrieval", "cache_render_rejection", "tier_minus_one"} <= stages
         assert len([event for outcome in outcomes for event in outcome.cost_events]) == 7
+        assert all(
+            event.effective_provider == "unattested"
+            and event.effective_model == "unattested"
+            and event.effective_reasoning == "unattested"
+            and event.effective_service_tier == "unattested"
+            for outcome in outcomes
+            for event in outcome.cost_events
+        )

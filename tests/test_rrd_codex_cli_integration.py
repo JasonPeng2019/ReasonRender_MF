@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -215,6 +217,8 @@ def _run(
     *,
     boundary: str = "",
     failure: str = "",
+    hook_source: str | None = None,
+    closed_product_path: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Provider, list[dict[str, Any]]]:
     provider = Provider()
     if boundary:
@@ -222,11 +226,12 @@ def _run(
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(mode=0o700)
     hook_log = tmp_path / "hooks.jsonl"
     hook = tmp_path / "hook.py"
     hook.write_text(
-        """import json,os,signal,sys,time
+        hook_source
+        or """import json,os,signal,sys,time
 p=json.load(sys.stdin)
 line=(json.dumps(p,separators=(',',':'))+'\\n').encode()
 fd=os.open(os.environ['HOOK_LOG'],os.O_APPEND|os.O_CREAT|os.O_WRONLY,0o600)
@@ -291,10 +296,16 @@ plugins=false
     fake_git = fake_bin / "git"
     fake_git.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$RRD_TEST_GIT_LOG"\nexit 97\n')
     fake_git.chmod(0o755)
+    codex = str((Path.home() / ".local/bin/codex").resolve(strict=True))
     env = {
         **os.environ,
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PATH": (
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            if closed_product_path
+            else f"{fake_bin}:{os.environ['PATH']}"
+        ),
         "CODEX_HOME": str(home),
+        "RRD_CODEX_BIN": codex,
         "TEST_KEY": "dummy",
         "HOOK_LOG": str(hook_log),
         "RRD_TEST_GIT_LOG": str(git_log),
@@ -305,7 +316,7 @@ plugins=false
     try:
         result = subprocess.run(
             [
-                "codex",
+                codex if closed_product_path else "codex",
                 "--dangerously-bypass-hook-trust",
                 "exec",
                 "--skip-git-repo-check",
@@ -323,11 +334,102 @@ plugins=false
         provider.shutdown()
         provider.server_close()
         thread.join(timeout=2)
-    events = [json.loads(line) for line in hook_log.read_text().splitlines()]
-    assert not git_log.exists(), git_log.read_text() if git_log.exists() else ""
+    events = (
+        [json.loads(line) for line in hook_log.read_text().splitlines()]
+        if hook_log.exists()
+        else []
+    )
+    if not closed_product_path:
+        assert not git_log.exists(), git_log.read_text() if git_log.exists() else ""
     return result, provider, events
 
 
+@pytest.mark.installed_fake_provider
+def test_installed_codex_hook_path_matches_the_closed_product_normalizer(
+    tmp_path: Path,
+) -> None:
+    hook_source = f"""import json,os,sys
+sys.path.insert(0,{str(REPO)!r})
+from contextmesh.scripts.rrd_codex_hook import _normalize_product_path
+p=json.load(sys.stdin)
+row={{'PATH':os.environ['PATH'],'CODEX_HOME':os.environ['CODEX_HOME'],'RRD_CODEX_BIN':os.environ['RRD_CODEX_BIN']}}
+observed=row['PATH']
+parts=observed.split(':')
+volatile=parts[0]
+chain=[os.environ['CODEX_HOME'],os.path.join(os.environ['CODEX_HOME'],'tmp'),os.path.join(os.environ['CODEX_HOME'],'tmp','arg0'),volatile,parts[1],os.path.join(parts[1],'rg')]
+metadata=[{{'path':path,'mode':oct(os.lstat(path).st_mode & 0o777),'uid':os.lstat(path).st_uid,'is_symlink':os.path.islink(path)}} for path in chain]
+with open(os.environ['HOOK_LOG'],'a') as f:
+ try:
+  _normalize_product_path(row)
+ except Exception as exc:
+  f.write(json.dumps({{'hook_event_name':p.get('hook_event_name'),'observed_path':observed,'error':type(exc).__name__+': '+str(exc)}},sort_keys=True)+'\\n')
+  raise
+ else:
+  f.write(json.dumps({{'hook_event_name':p.get('hook_event_name'),'observed_path':observed,'normalized_path':row['PATH'],'filesystem_metadata':metadata}},sort_keys=True)+'\\n')
+if p.get('hook_event_name')=='PreToolUse':
+ print(json.dumps({{'hookSpecificOutput':{{'hookEventName':'PreToolUse','permissionDecision':'allow'}}}}))
+else: print('{{}}')
+"""
+    result, provider, events = _run(
+        tmp_path,
+        hook_source=hook_source,
+        closed_product_path=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert provider.requests
+    assert events
+    assert all("error" not in row for row in events), events
+    assert all(
+        row["normalized_path"] == "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" for row in events
+    )
+    assert all(row["filesystem_metadata"][3]["mode"] == "0o755" for row in events)
+    assert all("/codex-path:" in row["observed_path"] for row in events)
+    output = os.environ.get("RRCV2_PATH_PROBE_OUTPUT")
+    if output:
+        codex = (
+            Path.home()
+            / ".codex/packages/standalone/releases/0.147.0-x86_64-apple-darwin/bin/codex"
+        )
+        release = codex.parent.parent / "codex-path"
+        rg = release / "rg"
+        value = {
+            "base_path": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "codex": {
+                "bytes": codex.stat().st_size,
+                "path": str(codex),
+                "sha256": hashlib.sha256(codex.read_bytes()).hexdigest(),
+                "version": "codex-cli 0.147.0",
+            },
+            "events": events,
+            "kind": "rrcv2_v22_codex_hook_path_probe",
+            "provider": {
+                "all_requests_loopback": True,
+                "endpoint": f"http://127.0.0.1:{provider.server_address[1]}/v1/responses",
+                "request_body_sha256s": [
+                    hashlib.sha256(
+                        json.dumps(row["body"], sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    for row in provider.requests
+                ],
+                "request_count": len(provider.requests),
+            },
+            "release_tool": {
+                "bytes": rg.stat().st_size,
+                "directory": str(release),
+                "mode": rg.stat().st_mode & 0o777,
+                "path": str(rg),
+                "sha256": hashlib.sha256(rg.read_bytes()).hexdigest(),
+            },
+            "v": 1,
+        }
+        target = Path(output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+        target.chmod(0o600)
+
+
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_accepts_rewrite_start_context_and_four_native_workers(
     tmp_path: Path,
 ) -> None:
@@ -373,6 +475,7 @@ def test_installed_codex_v1_accepts_rewrite_start_context_and_four_native_worker
 
 @pytest.mark.parametrize("boundary", ["PreToolUse", "SubagentStart", "SubagentStop"])
 @pytest.mark.parametrize("failure", ["empty", "malformed", "nonzero", "signal", "timeout"])
+@pytest.mark.installed_fake_provider
 def test_installed_codex_hook_failures_leave_four_workers_and_root_merge(
     tmp_path: Path, boundary: str, failure: str
 ) -> None:
@@ -389,6 +492,7 @@ def _capability_matrix():
     return rrcv2_capability_matrix
 
 
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_stable_keyring_home_capability(tmp_path: Path) -> None:
     from contextmesh.scripts import rrcv2_capability_preflight
 
@@ -442,6 +546,7 @@ def test_installed_codex_v1_stable_keyring_home_capability(tmp_path: Path) -> No
     assert not (fresh / "auth.json").exists()
 
 
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_rrcv2_worker_evidence_capability() -> None:
     summary = _capability_matrix().ensure(REPO)
     worker = summary["results"][8]
@@ -455,6 +560,7 @@ def test_installed_codex_v1_rrcv2_worker_evidence_capability() -> None:
     assert worker["provider_total_tokens"] == worker["input_tokens"] + worker["output_tokens"]
 
 
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_rrcv2_worker_does_not_inherit_root_source() -> None:
     summary = _capability_matrix().ensure(REPO)
     worker = summary["results"][8]
@@ -501,6 +607,7 @@ def test_installed_codex_v1_rrcv2_wait_substitution_capability(
     ]
 
 
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_rrcv2_stage_read_isolation_capability() -> None:
     summary = _capability_matrix().ensure(REPO)
     for row in summary["results"][:7]:
@@ -515,6 +622,7 @@ def test_installed_codex_v1_rrcv2_stage_read_isolation_capability() -> None:
         assert '"type":"collab_tool_call"' not in stdout
 
 
+@pytest.mark.installed_fake_provider
 def test_installed_codex_v1_rrcv2_nested_spec_spawn_capability() -> None:
     summary = _capability_matrix().ensure(REPO)
     assert summary["exact_call_count"] == 9
@@ -541,8 +649,9 @@ def test_installed_codex_v1_rrcv2_nested_spec_spawn_capability() -> None:
     assert {"PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop"} <= names
 
 
-def test_installed_codex_rrcv2_contextmesh_credibility_suite() -> None:
-    """Preserve failed v19 and consume the single reviewed v20 credibility attempt."""
+@pytest.mark.paid_live
+def test_installed_codex_rrcv2_v22_contextmesh_credibility_suite() -> None:
+    """Preserve failed predecessors and consume the single reviewed V22 attempt."""
 
     failed_v19 = (
         REPO
@@ -557,21 +666,38 @@ def test_installed_codex_rrcv2_contextmesh_credibility_suite() -> None:
     )
     assert json.loads((failed_v19 / "terminal.json").read_bytes())["status"] == "failure"
 
-    preimage = (
-        b'{"experiment_id":"rrcv2-cli-smoke-v20","fixture_manifest_sha256":'
-        b'"483db5cdc34b2ab16d99dd578ca87981e4b82e3d6ea53550be841fa7eedaaf39",'
-        b'"v":20}'
-    )
-    assert len(preimage) == 139
-    producer_sha = hashlib.sha256(preimage).hexdigest()
-    assert producer_sha == "7a66a30bbd2e7004724ba4aee1de7a879d87eb9212653e6a36d52d2cf1514744"
-    token = "rrcv2-cli-smoke-" + producer_sha[:32]
-    producer_root = (
+    failed_v20 = (
         REPO
         / ".generated/state/rrcv2-convergence/verify/cli-smoke/rrcv2-cli-smoke-v20"
+        / "7a66a30bbd2e7004724ba4aee1de7a879d87eb9212653e6a36d52d2cf1514744"
+    )
+    assert json.loads((failed_v20 / "terminal.json").read_bytes())["status"] == "failure"
+    failed_v21 = (
+        REPO
+        / ".generated/state/rrcv2-convergence/verify/cli-smoke/rrcv2-cli-smoke-v21"
+        / "47513926018fbb6544b9390ea8ddcf0e13efef37f0b9f28b503feeb4a81db3ff"
+    )
+    assert hashlib.sha256((failed_v21 / "producer.json").read_bytes()).hexdigest() == (
+        "7eb55db14f8367a7892f8cf0274fa0f1de756d091057f7257a4c91ac6be84bef"
+    )
+    assert hashlib.sha256((failed_v21 / "terminal.json").read_bytes()).hexdigest() == (
+        "85fdc2eff4a03f2b48131f91c2af8a7925925a1297bcbc4b8a41b89d228b9cd5"
+    )
+    assert json.loads((failed_v21 / "terminal.json").read_bytes())["status"] == "failure"
+    sys.path.insert(0, str(REPO / "contextmesh/scripts"))
+    try:
+        guard = runpy.run_path(str(REPO / "contextmesh/scripts/rrcv2_product_guard.py"))
+    finally:
+        sys.path.pop(0)
+    producer_sha = guard["PRODUCER_SHA256"]
+    assert os.environ.get("RRCV2_PAID_LIVE_PERMIT") == producer_sha
+    token = guard["ROUND_TOKEN"]
+    producer_root = (
+        REPO
+        / f".generated/state/rrcv2-convergence/verify/cli-smoke/{guard['EXPERIMENT_ID']}"
         / producer_sha
     )
-    assert not producer_root.exists(), "the one reviewed v20 producer was already consumed"
+    assert not producer_root.exists(), "the one reviewed V22 producer was already consumed"
     environment = dict(os.environ)
     for name in (
         "OPENAI_API_KEY",
@@ -581,6 +707,7 @@ def test_installed_codex_rrcv2_contextmesh_credibility_suite() -> None:
         "AWS_SESSION_TOKEN",
         "RRC_EVEROS_URL",
         "RRCV2_EVEROS_TARGET",
+        "RRCV2_PAID_LIVE_PERMIT",
     ):
         environment.pop(name, None)
     completed = subprocess.run(

@@ -7,7 +7,7 @@ import json
 import re
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +225,30 @@ def parse_codex_jsonl(stdout: str) -> tuple[str, Usage]:
     )
 
 
+def _cache_write_tokens(stdout: str) -> int:
+    """Return the sole turn's cache-write count without changing the public Usage seam."""
+
+    completed: list[int] = []
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        value = json.loads(line)
+        if isinstance(value, dict) and value.get("type") == "turn.completed":
+            usage = value.get("usage")
+            if not isinstance(usage, dict):
+                raise ValueError("codex exec completed without a usage object")
+            if "cache_write_input_tokens" not in usage:
+                raise ValueError("codex exec cache-write usage is missing")
+            count = usage["cache_write_input_tokens"]
+            parsed = _token_count(count)
+            if parsed is None:
+                raise ValueError("codex exec cache-write usage is invalid")
+            completed.append(parsed)
+    if len(completed) != 1:
+        raise ValueError("codex exec has no sole cache-write usage authority")
+    return completed[0]
+
+
 class CodexModel(ModelPort):
     """Run one noninteractive, read-only Codex completion per Lane A stage."""
 
@@ -237,6 +261,7 @@ class CodexModel(ModelPort):
         small_model: str = "gpt-5.6-luna",
         executable: str = "codex",
         artifact_log: str | Path | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._models = {
             ModelRole.STRONG: strong_model,
@@ -244,6 +269,7 @@ class CodexModel(ModelPort):
         }
         self._executable = executable
         self._artifact_log = Path(artifact_log) if artifact_log is not None else None
+        self._environment = None if environment is None else dict(environment)
         self.product_cell_id: str | None = None
 
     def _record(
@@ -256,6 +282,9 @@ class CodexModel(ModelPort):
         stage: str,
         text: str,
         usage: Usage,
+        cache_write_input_tokens: int,
+        transcript_sha256: str,
+        requested_reasoning: str,
     ) -> None:
         if self._artifact_log is None:
             return
@@ -266,10 +295,14 @@ class CodexModel(ModelPort):
             "stage": stage,
             "role": role.value,
             "model": model,
+            "requested_reasoning": requested_reasoning,
+            "requested_service_tier": "priority",
             "prompt": prompt,
             "response": text,
+            "transcript_sha256": transcript_sha256,
             "usage": {
                 "cached_input_tokens": usage.cached_input_tokens,
+                "cache_write_input_tokens": cache_write_input_tokens,
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
                 "reasoning_output_tokens": usage.reasoning_output_tokens,
@@ -345,6 +378,7 @@ class CodexModel(ModelPort):
                     text=True,
                     check=False,
                     timeout=300,
+                    env=self._environment,
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"could not start codex exec: {exc}") from exc
@@ -353,6 +387,8 @@ class CodexModel(ModelPort):
             raise RuntimeError(f"codex exec failed with exit code {result.returncode}{detail}")
 
         text, usage = parse_codex_jsonl(result.stdout)
+        cache_write_input_tokens = _cache_write_tokens(result.stdout)
+        transcript_sha256 = hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
         self._record(
             role=role,
             model=model,
@@ -361,12 +397,15 @@ class CodexModel(ModelPort):
             stage=stage,
             text=text,
             usage=usage,
+            cache_write_input_tokens=cache_write_input_tokens,
+            transcript_sha256=transcript_sha256,
+            requested_reasoning=reasoning,
         )
         return Completion(
             text=text,
             usage=usage,
             model=model,
-            transcript_sha256=hashlib.sha256(result.stdout.encode("utf-8")).hexdigest(),
+            transcript_sha256=transcript_sha256,
             identity_attestation="native_partial",
             effective_provider="openai",
             effective_reasoning=reasoning,

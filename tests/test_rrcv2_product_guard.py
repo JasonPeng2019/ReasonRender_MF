@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib
 import json
@@ -29,9 +30,140 @@ def test_reviewed_fixture_and_producer_constants_reopen_exactly() -> None:
     value = guard.load_fixture(fixture)
     assert [row["kind"] for row in value["cases"]] == ["miss", "hit", "near"]
     assert hashlib.sha256(fixture.read_bytes()).hexdigest() == guard.FIXTURE_SHA256
-    assert len(guard._producer_preimage()) == 139  # noqa: SLF001
     assert hashlib.sha256(guard._producer_preimage()).hexdigest() == guard.PRODUCER_SHA256  # noqa: SLF001
     assert guard.ROUND_TOKEN.endswith(guard.PRODUCER_SHA256[:32])
+    guard._validate_self()  # noqa: SLF001
+
+
+def test_v22_predecessor_and_launch_authorities_reopen_exactly() -> None:
+    guard._validate_predecessor_manifest(ROOT)  # noqa: SLF001
+    guard._validate_launch_manifest(ROOT)  # noqa: SLF001
+
+
+def test_diff_review_requires_current_forked_ship_subject(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "fixture@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repo, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("initial\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
+    review_root = repo / ".generated/state/rrcv2-convergence/reviews"
+    review_root.mkdir(parents=True)
+    transcript = review_root / "v21-diff.txt"
+    transcript.write_text("VERDICT: SHIP\n")
+    transcript.chmod(0o600)
+    record = repo / ".generated/state/reviews/diff-worktree.toml"
+    record.parent.mkdir(parents=True)
+    subject = guard._current_diff_subject(repo)  # noqa: SLF001
+    record.write_text(
+        "\n".join(
+            (
+                'kind = "diff"',
+                'scope = "worktree"',
+                'verdict = "SHIP"',
+                f'subject_hash = "{subject}"',
+                f'transcript_hash = "{hashlib.sha256(transcript.read_bytes()).hexdigest()}"',
+                'origin = "forked"',
+                'mode = "unleashed"',
+                'audience_entry_id = ""',
+                'persona = ""',
+                'recorded_at = "2026-08-12T00:00:00Z"',
+                f'repo_root = "{repo}"',
+                'workspace_session = ""',
+                'workspace_runtime_root = ""',
+                "",
+            )
+        )
+    )
+    record.chmod(0o600)
+    guard._validate_fresh_diff_review(repo)  # noqa: SLF001
+    tracked.write_text("changed\n")
+    with pytest.raises(guard.GuardError, match="absent, stale, or not SHIP"):
+        guard._validate_fresh_diff_review(repo)  # noqa: SLF001
+
+
+def test_prepublication_commands_reject_forged_true_receipts(tmp_path: Path) -> None:
+    specs = guard._prepublication_command_specs(tmp_path)  # noqa: SLF001
+    commands = [
+        {
+            "argv": ["true"],
+            "environment": {},
+            "exit_code": 0,
+            "name": name,
+            "output_bytes": 0,
+            "output_path": (
+                f".generated/state/rrcv2-convergence/verify/v22-command-receipts/{name}.log"
+            ),
+            "output_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        for name in specs
+    ]
+    with pytest.raises(guard.GuardError, match="command receipt differs"):
+        guard._validate_prepublication_commands(  # noqa: SLF001
+            tmp_path, commands, command_specs=specs
+        )
+
+
+def test_prepublication_commands_reopen_exact_argv_environment_and_output(
+    tmp_path: Path,
+) -> None:
+    output = b"735 passed, 63 deselected\n"
+    relative = ".generated/state/rrcv2-convergence/verify/v22-command-receipts/ordinary.log"
+    output_path = tmp_path / relative
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(output)
+    output_path.chmod(0o600)
+    specs = {
+        "ordinary": (
+            ["uv", "run", "--locked", "pytest", "-q"],
+            {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+            (b"735 passed", b"63 deselected"),
+        )
+    }
+    row = {
+        "argv": specs["ordinary"][0],
+        "environment": specs["ordinary"][1],
+        "exit_code": 0,
+        "name": "ordinary",
+        "output_bytes": len(output),
+        "output_path": relative,
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+    }
+    guard._validate_prepublication_commands(  # noqa: SLF001
+        tmp_path, [row], command_specs=specs
+    )
+
+    row["argv"] = ["true"]
+    with pytest.raises(guard.GuardError, match="command receipt differs"):
+        guard._validate_prepublication_commands(  # noqa: SLF001
+            tmp_path, [row], command_specs=specs
+        )
+    row["argv"] = specs["ordinary"][0]
+    output_path.write_bytes(b"forged\n")
+    output_path.chmod(0o600)
+    with pytest.raises(guard.GuardError, match="output differs"):
+        guard._validate_prepublication_commands(  # noqa: SLF001
+            tmp_path, [row], command_specs=specs
+        )
+
+
+def test_stable_home_lock_acquisition_has_a_wall_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    lock = home / ".rrcv2-product-home.lock"
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(guard, "_STABLE_HOME_LOCK_SECONDS", 0.01)
+        with pytest.raises(guard.GuardError, match="lock acquisition timed out"):
+            guard.prepare_stable_home(repo=ROOT, home=home, user_home=tmp_path)
+    finally:
+        os.close(descriptor)
 
 
 def test_isolated_smoke_bootstrap_imports_only_from_bound_paths(tmp_path: Path) -> None:
@@ -128,12 +260,26 @@ def test_product_environment_has_the_closed_prefix_inventory(tmp_path: Path) -> 
     )
     assert len([key for key in env if key.startswith("RRD_")]) == 15
     assert len([key for key in env if key.startswith("RRC_")]) == 14
-    assert len([key for key in env if key.startswith("RRCV2_")]) == 15
+    assert len([key for key in env if key.startswith("RRCV2_")]) == 16
     assert set(env).isdisjoint(
         {"OPENAI_API_KEY", "RRC_CONTROL", "RRC_EVEROS_URL", "RRCV2_EVEROS_TARGET"}
     )
     assert env["RRD_MEMORY_BACKEND"] == "sqlite"
     assert env["RRD_WORKER_MODEL"] == "gpt-5.6-luna"
+    assert env["RRCV2_DOCKER_BIN"] == str(Path("/usr/local/bin/docker").resolve())
+
+
+def test_product_verifier_uses_only_the_bound_docker_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rrc.pipeline import sandbox
+
+    monkeypatch.setenv("RRCV2_PRODUCT_SMOKE", "1")
+    monkeypatch.setenv("RRCV2_DOCKER_BIN", "/usr/local/bin/docker")
+    assert sandbox._docker_binary() == "/usr/local/bin/docker"  # noqa: SLF001
+    monkeypatch.setenv("RRCV2_DOCKER_BIN", "docker")
+    with pytest.raises(sandbox.SandboxUnavailable, match="authority is missing"):
+        sandbox._docker_binary()  # noqa: SLF001
 
 
 def test_stable_home_reconciles_stale_config_and_recovers_exact_temp(
@@ -231,13 +377,20 @@ def test_credential_profile_probe_requires_kernel_denial_and_writable_control(
 
 def test_producer_is_one_shot_and_recovers_linked_temporary(tmp_path: Path) -> None:
     root = tmp_path / "producer"
-    assert guard.publish_producer(root) is True
-    assert guard.publish_producer(root) is False
+    root.mkdir(mode=0o700)
+    preparation = root / "preparation.json"
+    preparation.write_bytes(guard._preparation_value())  # noqa: SLF001
+    preparation.chmod(0o600)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    round_authority = guard._owned_directory(round_root)  # noqa: SLF001
+    assert guard.publish_producer(root, round_authority=round_authority) is True
+    assert guard.publish_producer(root, round_authority=round_authority) is False
     final = root / "producer.json"
-    temporary = root / ".producer.v20.tmp"
-    os.link(final, temporary)
-    assert guard.publish_producer(root) is False
-    assert not temporary.exists()
+    temporary = root / ".producer.v22.tmp"
+    assert guard.publish_producer(root, round_authority=round_authority) is False
+    assert temporary.is_file()
+    assert temporary.stat().st_ino == final.stat().st_ino
     assert stat.S_IMODE(final.stat().st_mode) == 0o600
     assert json.loads(final.read_bytes())["producer_sha256"] == guard.PRODUCER_SHA256
 
@@ -245,14 +398,331 @@ def test_producer_is_one_shot_and_recovers_linked_temporary(tmp_path: Path) -> N
 def test_producer_rejects_foreign_temporary_without_mutating_it(tmp_path: Path) -> None:
     root = tmp_path / "producer"
     root.mkdir(mode=0o700)
-    temporary = root / ".producer.v20.tmp"
+    temporary = root / ".producer.v22.tmp"
     temporary.write_bytes(b"foreign")
     temporary.chmod(0o600)
+    preparation = root / "preparation.json"
+    preparation.write_bytes(guard._preparation_value())  # noqa: SLF001
+    preparation.chmod(0o600)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
     before = hashlib.sha256(temporary.read_bytes()).hexdigest()
     with pytest.raises(guard.GuardError, match="temporary differs"):
-        guard.publish_producer(root)
+        guard.publish_producer(
+            root,
+            round_authority=guard._owned_directory(round_root),  # noqa: SLF001
+        )
     assert hashlib.sha256(temporary.read_bytes()).hexdigest() == before
     assert not (root / "producer.json").exists()
+
+
+def test_zero_provider_prepublication_failure_removes_only_exact_prepared_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    producer_authority = guard._owned_directory(root)  # noqa: SLF001
+    round_authority = guard._owned_directory(round_root)  # noqa: SLF001
+    assert (
+        guard._reconcile_unpublished_root(root, producer_authority, round_authority)  # noqa: SLF001
+        is False
+    )
+    assert not root.exists()
+
+    root.mkdir(mode=0o700)
+    round_root.mkdir(mode=0o700)
+    (root / "preparation.json").write_bytes(guard._preparation_value())  # noqa: SLF001
+    (root / "preparation.json").chmod(0o600)
+    producer_authority = guard._owned_directory(root)  # noqa: SLF001
+    round_authority = guard._owned_directory(round_root)  # noqa: SLF001
+    assert guard.publish_producer(root, round_authority=round_authority) is True
+    assert (
+        guard._reconcile_unpublished_root(root, producer_authority, round_authority)  # noqa: SLF001
+        is True
+    )
+    assert (root / "producer.json").is_file()
+
+
+def test_publish_preserves_and_reopens_exact_preparation_marker_before_launch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    (root / "round").mkdir(mode=0o700)
+    preparation = root / "preparation.json"
+    preparation.write_bytes(guard._preparation_value())  # noqa: SLF001
+    preparation.chmod(0o600)
+
+    round_authority = guard._owned_directory(root / "round")  # noqa: SLF001
+    assert guard.publish_producer(root, round_authority=round_authority) is True
+    assert (root / "producer.json").read_bytes() == guard.producer_value()
+    assert preparation.read_bytes() == guard._preparation_value()  # noqa: SLF001
+    assert {path.name for path in root.iterdir()} == {
+        "preparation.json",
+        ".producer.v22.tmp",
+        "producer.json",
+        "round",
+    }
+
+
+def test_publish_requires_preparation_for_every_fresh_attempt(tmp_path: Path) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    with pytest.raises(guard.GuardError, match="preparation authority is missing"):
+        guard.publish_producer(
+            root,
+            round_authority=guard._owned_directory(round_root),  # noqa: SLF001
+        )
+
+
+@pytest.mark.parametrize("mutation", ["replace", "rename", "inject"])
+def test_publish_rejects_marker_or_inventory_substitution_without_deleting_foreign_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    (root / "round").mkdir(mode=0o700)
+    marker = root / "preparation.json"
+    marker.write_bytes(guard._preparation_value())  # noqa: SLF001
+    marker.chmod(0o600)
+    original_fsync = guard._fsync_dir  # noqa: SLF001
+    mutated = False
+
+    def mutate_after_publish(path: Path) -> None:
+        nonlocal mutated
+        original_fsync(path)
+        if not mutated and (root / "producer.json").exists():
+            if mutation in {"replace", "rename"}:
+                marker.rename(root / "original-preparation.json")
+            if mutation == "replace":
+                marker.write_bytes(b"foreign")
+                marker.chmod(0o600)
+            elif mutation == "inject":
+                (root / "foreign-entry").write_bytes(b"foreign")
+            mutated = True
+
+    monkeypatch.setattr(guard, "_fsync_dir", mutate_after_publish)
+    with pytest.raises(guard.GuardError, match="publication inventory|preparation"):
+        guard.publish_producer(
+            root,
+            round_authority=guard._owned_directory(root / "round"),  # noqa: SLF001
+        )
+    if mutation == "replace":
+        assert marker.read_bytes() == b"foreign"
+    elif mutation == "rename":
+        assert (root / "original-preparation.json").read_bytes() == guard._preparation_value()  # noqa: SLF001
+    else:
+        assert (root / "foreign-entry").read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_publish_rejects_temporary_substitution_without_deleting_foreign_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: bool,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    marker = root / "preparation.json"
+    marker.write_bytes(guard._preparation_value())  # noqa: SLF001
+    marker.chmod(0o600)
+    temporary = root / ".producer.v22.tmp"
+    if recovery:
+        temporary.write_bytes(guard.producer_value())
+        temporary.chmod(0o600)
+    original_fsync = guard._fsync_dir  # noqa: SLF001
+    mutated = False
+
+    def replace_temporary(path: Path) -> None:
+        nonlocal mutated
+        original_fsync(path)
+        if not mutated and (root / "producer.json").exists():
+            temporary.rename(root / "original-temporary")
+            temporary.write_bytes(b"foreign")
+            temporary.chmod(0o600)
+            mutated = True
+
+    monkeypatch.setattr(guard, "_fsync_dir", replace_temporary)
+    with pytest.raises(guard.GuardError, match="linked publication|links|publication|authority"):
+        guard.publish_producer(
+            root,
+            round_authority=guard._owned_directory(round_root),  # noqa: SLF001
+        )
+    assert temporary.read_bytes() == b"foreign"
+    assert (root / "original-temporary").read_bytes() == guard.producer_value()
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_publish_rejects_exact_content_linked_pair_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: bool,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    marker = root / "preparation.json"
+    marker.write_bytes(guard._preparation_value())  # noqa: SLF001
+    marker.chmod(0o600)
+    temporary = root / ".producer.v22.tmp"
+    final = root / "producer.json"
+    if recovery:
+        temporary.write_bytes(guard.producer_value())
+        temporary.chmod(0o600)
+    original_authority = tmp_path / "authenticated-temporary"
+    original_fsync = guard._fsync_dir  # noqa: SLF001
+    mutated = False
+
+    def replace_exact_pair(path: Path) -> None:
+        nonlocal mutated
+        original_fsync(path)
+        if not mutated and final.exists():
+            temporary.rename(original_authority)
+            final.unlink()
+            temporary.write_bytes(guard.producer_value())
+            temporary.chmod(0o600)
+            os.link(temporary, final, follow_symlinks=False)
+            mutated = True
+
+    monkeypatch.setattr(guard, "_fsync_dir", replace_exact_pair)
+    with pytest.raises(guard.GuardError, match="publication authority|published producer"):
+        guard.publish_producer(
+            root,
+            round_authority=guard._owned_directory(round_root),  # noqa: SLF001
+        )
+    assert original_authority.read_bytes() == guard.producer_value()
+    assert temporary.read_bytes() == guard.producer_value()
+    assert final.read_bytes() == guard.producer_value()
+    assert temporary.stat().st_ino == final.stat().st_ino
+    assert temporary.stat().st_ino != original_authority.stat().st_ino
+
+
+def test_publish_rejects_missing_replaced_round_and_preexisting_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "missing-round"
+    missing.mkdir(mode=0o700)
+    (missing / "preparation.json").write_bytes(guard._preparation_value())  # noqa: SLF001
+    (missing / "preparation.json").chmod(0o600)
+    with pytest.raises(guard.GuardError, match="inventory"):
+        guard.publish_producer(
+            missing,
+            round_authority=guard._owned_directory(tmp_path),  # noqa: SLF001
+        )
+
+    terminal = tmp_path / "preexisting-terminal"
+    terminal.mkdir(mode=0o700)
+    terminal_round = terminal / "round"
+    terminal_round.mkdir(mode=0o700)
+    (terminal / "preparation.json").write_bytes(guard._preparation_value())  # noqa: SLF001
+    (terminal / "preparation.json").chmod(0o600)
+    (terminal / "terminal.json").write_bytes(b"foreign")
+    (terminal / "terminal.json").chmod(0o600)
+    with pytest.raises(guard.GuardError, match="inventory"):
+        guard.publish_producer(
+            terminal,
+            round_authority=guard._owned_directory(terminal_round),  # noqa: SLF001
+        )
+
+    root = tmp_path / "replace-round"
+    root.mkdir(mode=0o700)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    authority = guard._owned_directory(round_root)  # noqa: SLF001
+    (root / "preparation.json").write_bytes(guard._preparation_value())  # noqa: SLF001
+    (root / "preparation.json").chmod(0o600)
+    original_fsync = guard._fsync_dir  # noqa: SLF001
+    mutated = False
+
+    def replace_round(path: Path) -> None:
+        nonlocal mutated
+        original_fsync(path)
+        if not mutated and (root / "producer.json").exists():
+            round_root.rename(root / "original-round")
+            round_root.mkdir(mode=0o700)
+            mutated = True
+
+    monkeypatch.setattr(guard, "_fsync_dir", replace_round)
+    with pytest.raises(guard.GuardError, match="directory identity|inventory"):
+        guard.publish_producer(root, round_authority=authority)
+
+
+def test_preflight_executable_resolution_failure_does_not_wedge_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "producer"
+
+    def reject(_value: str) -> Path:
+        raise guard.GuardError("injected executable failure")
+
+    monkeypatch.setattr(guard, "resolve_executable", reject)
+    with pytest.raises(guard.GuardError, match="injected executable"):
+        guard._preflight_before_publish(  # noqa: SLF001
+            repo=ROOT,
+            fixture=ROOT / "tests/fixtures/rrcv2_cli_smoke/manifest.json",
+            producer_root=root,
+        )
+    assert not root.exists()
+
+
+def test_experiment_reservation_prevents_a_late_loser_from_deleting_winner(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "experiment"
+    parent.mkdir(mode=0o700)
+    winner = guard._acquire_experiment_lease(parent)  # noqa: SLF001
+    producer = parent / "producer"
+    producer.mkdir(mode=0o700)
+    marker = producer / "producer.json"
+    marker.write_bytes(b"winner")
+    try:
+        with pytest.raises(guard.GuardError, match="already reserved"):
+            guard._acquire_experiment_lease(parent)  # noqa: SLF001
+        assert marker.read_bytes() == b"winner"
+    finally:
+        winner.close()
+
+    successor = guard._acquire_experiment_lease(parent)  # noqa: SLF001
+    try:
+        assert marker.read_bytes() == b"winner"
+    finally:
+        successor.close()
+
+
+def test_abandoned_marker_bound_preparation_is_recovered_without_a_paid_call(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    (root / "preparation.json").write_bytes(guard._preparation_value())  # noqa: SLF001
+    (root / "preparation.json").chmod(0o600)
+    round_root = root / "round"
+    round_root.mkdir(mode=0o700)
+    (round_root / "partial").write_text("zero-provider preparation")
+
+    guard._reconcile_abandoned_preparation(root)  # noqa: SLF001
+
+    assert not root.exists()
+
+
+def test_unmarked_abandoned_root_is_never_deleted(tmp_path: Path) -> None:
+    root = tmp_path / "producer"
+    root.mkdir(mode=0o700)
+    marker = root / "foreign"
+    marker.write_text("preserve")
+    with pytest.raises((FileNotFoundError, guard.GuardError)):
+        guard._reconcile_abandoned_preparation(root)  # noqa: SLF001
+    assert marker.read_text() == "preserve"
 
 
 def _lifecycle_environment(tmp_path: Path) -> dict[str, str]:
@@ -294,11 +764,12 @@ def test_main_launch_is_registered_before_release_and_cleanup_is_bounded(
     rows = list(Path(environment["RRCV2_SMOKE_CHILD_REGISTRY"]).iterdir())
     assert len(rows) == 1
     assert json.loads(rows[0].read_bytes())["state"] == "live"
-    monkeypatch.setattr(guard, "_docker_cleanup", lambda _environment: None)
+    monkeypatch.setattr(guard, "_docker_cleanup", lambda _environment, _docker_bin: None)
     guard._cleanup_product(  # noqa: SLF001
         process=process,
         environment=environment,
         cancellation_root=Path(environment["RRCV2_SMOKE_CANCELLATION_ROOT"]),
+        docker_bin=Path("/usr/local/bin/docker"),
     )
     assert process.poll() is not None
     assert (Path(environment["RRCV2_SMOKE_CANCELLATION_REQUEST"])).is_file()

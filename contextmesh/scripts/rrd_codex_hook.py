@@ -128,6 +128,7 @@ _PRODUCT_RRC_KEYS = frozenset(
 _PRODUCT_RRCV2_KEYS = frozenset(
     {
         "RRCV2_ATTEMPTS_ROOT",
+        "RRCV2_DOCKER_BIN",
         "RRCV2_OWNER_SCOPE",
         "RRCV2_ROUTE_ID",
         "RRCV2_CELL_ID",
@@ -145,11 +146,13 @@ _PRODUCT_RRCV2_KEYS = frozenset(
     }
 )
 _PRODUCT_PREFIX_KEYS = _PRODUCT_RRD_KEYS | _PRODUCT_RRC_KEYS | _PRODUCT_RRCV2_KEYS
-_PRODUCT_ROUND = "rrd-sqlite-rrcv2-cli-smoke-7a66a30bbd2e7004724ba4aee1de7a87"
-_PRODUCT_TOKEN = "rrcv2-cli-smoke-7a66a30bbd2e7004724ba4aee1de7a87"
-_PRODUCT_PRODUCER = "7a66a30bbd2e7004724ba4aee1de7a879d87eb9212653e6a36d52d2cf1514744"
+_PRODUCT_EXPERIMENT = "rrcv2-cli-smoke-v22"
 _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+_CODEX_ARG0_CHILD = re.compile(r"codex-arg0[A-Za-z0-9]{6}\Z")
+_PRODUCT_BASE_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+_CODEX_PATH_RG_BYTES = 4_437_184
+_CODEX_PATH_RG_SHA256 = "1a49284bea601c2f084c62a834f859d6b1bc23a37dbd98b6f8da0b10b2b35037"
 _TRAMPOLINE = """\
 import os,signal,sys
 gate=int(sys.argv[1]); request=sys.argv[2]; argv=sys.argv[3:]
@@ -337,6 +340,11 @@ def _rrcv2_runtime() -> tuple[SQLiteRRCRepository, AttemptRepository, ContextMes
         small_model="gpt-5.6-luna",
         executable=os.environ.get("RRD_CODEX_BIN", "codex"),
         artifact_log=os.environ.get("RRC_DEMO_MODEL_EVENTS"),
+        environment=(
+            _validated_product_environment(os.environ)
+            if os.environ.get("RRCV2_PRODUCT_SMOKE") == "1"
+            else None
+        ),
     )
     product_cell_id = os.environ.get("RRCV2_CELL_ID")
     if product_cell_id:
@@ -678,6 +686,176 @@ def _sanitized_environment() -> dict[str, str]:
     return result
 
 
+def _owned_directory_metadata(metadata: os.stat_result, *, mode: int, label: str) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise HookError(f"product PATH {label} authority differs")
+
+
+def _open_owned_directory(path: Path, *, mode: int, label: str) -> tuple[int, os.stat_result]:
+    before = os.lstat(path)
+    _owned_directory_metadata(before, mode=mode, label=label)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        os.close(descriptor)
+        raise HookError(f"product PATH {label} changed while opening")
+    return descriptor, opened
+
+
+def _open_owned_child_directory(
+    parent: int, name: str, *, mode: int, label: str
+) -> tuple[int, os.stat_result]:
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    _owned_directory_metadata(before, mode=mode, label=label)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=parent,
+    )
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        os.close(descriptor)
+        raise HookError(f"product PATH {label} changed while opening")
+    return descriptor, opened
+
+
+def _validate_codex_release_path(result: Mapping[str, str], release: Path) -> None:
+    expected = Path(result["RRD_CODEX_BIN"]).parent.parent / "codex-path"
+    if release != expected:
+        raise HookError("product PATH Codex release directory differs")
+    directory, opened = _open_owned_directory(expected, mode=0o755, label="release directory")
+    try:
+        if os.listdir(directory) != ["rg"]:
+            raise HookError("product PATH Codex release inventory differs")
+        before = os.stat("rg", dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o755
+            or before.st_size != _CODEX_PATH_RG_BYTES
+        ):
+            raise HookError("product PATH Codex release tool metadata differs")
+        descriptor = os.open(
+            "rg",
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory,
+        )
+        try:
+            tool = os.fstat(descriptor)
+            if (tool.st_dev, tool.st_ino) != (before.st_dev, before.st_ino):
+                raise HookError("product PATH Codex release tool changed while opening")
+            digest = hashlib.sha256()
+            remaining = _CODEX_PATH_RG_BYTES + 1
+            total = 0
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(descriptor)
+        if total != _CODEX_PATH_RG_BYTES or digest.hexdigest() != _CODEX_PATH_RG_SHA256:
+            raise HookError("product PATH Codex release tool bytes differ")
+        after_tool = os.stat("rg", dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(after_tool.st_mode)
+            or after_tool.st_uid != os.getuid()
+            or stat.S_IMODE(after_tool.st_mode) != 0o755
+            or (after_tool.st_dev, after_tool.st_ino) != (tool.st_dev, tool.st_ino)
+        ):
+            raise HookError("product PATH Codex release tool changed")
+        if os.listdir(directory) != ["rg"]:
+            raise HookError("product PATH Codex release inventory changed")
+        after = os.lstat(expected)
+        _owned_directory_metadata(after, mode=0o755, label="release directory")
+        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+            raise HookError("product PATH Codex release directory changed")
+    finally:
+        os.close(directory)
+
+
+def _normalize_product_path(result: dict[str, str]) -> None:
+    observed = result["PATH"]
+    suffix = ":" + _PRODUCT_BASE_PATH
+    if not observed.endswith(suffix):
+        raise HookError("product PATH base differs")
+    prefix = observed[: -len(suffix)].split(":")
+    if len(prefix) != 2 or any(not item or not Path(item).is_absolute() for item in prefix):
+        raise HookError("product PATH prefix inventory differs")
+    volatile = Path(prefix[0])
+    release = Path(prefix[1])
+    home = Path(result["CODEX_HOME"])
+    expected_parent = home.resolve(strict=True) / "tmp" / "arg0"
+    if volatile.parent != expected_parent or _CODEX_ARG0_CHILD.fullmatch(volatile.name) is None:
+        raise HookError("product PATH volatile child differs")
+
+    home_fd, home_metadata = _open_owned_directory(home, mode=0o700, label="CODEX_HOME")
+    try:
+        tmp_fd, tmp_metadata = _open_owned_child_directory(home_fd, "tmp", mode=0o755, label="tmp")
+        try:
+            arg0_fd, arg0_metadata = _open_owned_child_directory(
+                tmp_fd, "arg0", mode=0o700, label="arg0"
+            )
+            try:
+                child_fd, child_metadata = _open_owned_child_directory(
+                    arg0_fd, volatile.name, mode=0o755, label="volatile child"
+                )
+                os.close(child_fd)
+                after = os.stat(volatile.name, dir_fd=arg0_fd, follow_symlinks=False)
+                _owned_directory_metadata(after, mode=0o755, label="volatile child")
+                if (after.st_dev, after.st_ino) != (child_metadata.st_dev, child_metadata.st_ino):
+                    raise HookError("product PATH volatile child changed")
+            finally:
+                os.close(arg0_fd)
+            after_arg0 = os.stat("arg0", dir_fd=tmp_fd, follow_symlinks=False)
+            _owned_directory_metadata(after_arg0, mode=0o700, label="arg0")
+            if (after_arg0.st_dev, after_arg0.st_ino) != (
+                arg0_metadata.st_dev,
+                arg0_metadata.st_ino,
+            ):
+                raise HookError("product PATH arg0 changed")
+        finally:
+            os.close(tmp_fd)
+        after_tmp = os.stat("tmp", dir_fd=home_fd, follow_symlinks=False)
+        _owned_directory_metadata(after_tmp, mode=0o755, label="tmp")
+        if (after_tmp.st_dev, after_tmp.st_ino) != (
+            tmp_metadata.st_dev,
+            tmp_metadata.st_ino,
+        ):
+            raise HookError("product PATH tmp changed")
+        after_home = os.lstat(home)
+        _owned_directory_metadata(after_home, mode=0o700, label="CODEX_HOME")
+        if (after_home.st_dev, after_home.st_ino) != (
+            home_metadata.st_dev,
+            home_metadata.st_ino,
+        ):
+            raise HookError("product PATH CODEX_HOME changed")
+    finally:
+        os.close(home_fd)
+    _validate_codex_release_path(result, release)
+    result["PATH"] = _PRODUCT_BASE_PATH
+
+
 def _validated_product_environment(source: Mapping[str, str]) -> dict[str, str]:
     """Re-derive the closed M6 child map instead of copying prefix wildcards."""
 
@@ -685,8 +863,49 @@ def _validated_product_environment(source: Mapping[str, str]) -> dict[str, str]:
     if observed != _PRODUCT_PREFIX_KEYS:
         raise HookError("product environment prefix inventory differs")
     result = {name: source[name] for name in _PRODUCT_SYSTEM_KEYS | _PRODUCT_PREFIX_KEYS}
+    _normalize_product_path(result)
+    repo = Path(__file__).resolve().parents[2]
+    producer_root = Path(result["RRCV2_SMOKE_PRODUCER_ROOT"])
+    expected_parent = (
+        repo / ".generated/state/rrcv2-convergence/verify/cli-smoke" / _PRODUCT_EXPERIMENT
+    )
+    if producer_root.parent != expected_parent or _HEX_64.fullmatch(producer_root.name) is None:
+        raise HookError("product producer root differs")
+    producer_raw, _ = _read_bounded_regular(producer_root / "producer.json", cap=4096)
+    try:
+        producer = json.loads(producer_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HookError("product producer authority is malformed") from exc
+    if (
+        not isinstance(producer, dict)
+        or canonical_json_bytes(producer) != producer_raw
+        or set(producer)
+        != {
+            "experiment_id",
+            "fixture_manifest_sha256",
+            "launch_manifest_sha256",
+            "predecessor_manifest_sha256",
+            "price_authority_sha256",
+            "producer_sha256",
+            "round_token",
+            "session_plan_sha256",
+            "session_review_sha256",
+            "v",
+        }
+        or producer.get("experiment_id") != _PRODUCT_EXPERIMENT
+        or producer.get("producer_sha256") != producer_root.name
+        or producer.get("v") != 22
+    ):
+        raise HookError("product producer authority differs")
+    product_token = producer.get("round_token")
+    if (
+        not isinstance(product_token, str)
+        or re.fullmatch(r"rrcv2-cli-smoke-[0-9a-f]{32}", product_token) is None
+    ):
+        raise HookError("product round token differs")
+    product_round = "rrd-sqlite-" + product_token
     literals = {
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": _PRODUCT_BASE_PATH,
         "LANG": "en_US.UTF-8",
         "LC_ALL": "en_US.UTF-8",
         "TERM": "dumb",
@@ -699,7 +918,7 @@ def _validated_product_environment(source: Mapping[str, str]) -> dict[str, str]:
         "RRD_EXTERNAL_SANDBOX": "1",
         "RRD_MEMORY_BACKEND": "sqlite",
         "RRD_SUMMARY_MODE": "deterministic",
-        "RRC_DEMO_ROUND": _PRODUCT_ROUND,
+        "RRC_DEMO_ROUND": product_round,
         "RRC_DEMO_MODE": "warm",
         "RRC_STRONG_MODEL": "gpt-5.5",
         "RRC_REQUIRE_EFFECTIVE_MODEL": "1",
@@ -717,22 +936,16 @@ def _validated_product_environment(source: Mapping[str, str]) -> dict[str, str]:
             raise HookError(f"product environment key is empty: {name}")
     round_root = Path(result["RRC_DEMO_DATABASE"]).parent
     cell = Path(result["RRD_TARGET_ROOT"]).parent
-    repo = Path(__file__).resolve().parents[2]
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-    producer_root = (
-        repo
-        / ".generated/state/rrcv2-convergence/verify/cli-smoke"
-        / "rrcv2-cli-smoke-v20"
-        / _PRODUCT_PRODUCER
-    )
     expected_scalars = {
         "HOME": str(real_home),
         "CODEX_HOME": str(repo / "contextmesh/.codex-rrd-native"),
         "RRD_REPO_ROOT": str(repo),
         "RRD_CODEX_BIN": str((real_home / ".local/bin/codex").resolve(strict=True)),
         "RRC_DEMO_UV_BIN": str(Path("/usr/local/bin/uv").resolve(strict=True)),
+        "RRCV2_DOCKER_BIN": str(Path("/usr/local/bin/docker").resolve(strict=True)),
         "RRC_DEMO_DATABASE": str(producer_root / "round/rrcv2.sqlite3"),
-        "RRCV2_OWNER_SCOPE": "cm-" + _sha(_PRODUCT_TOKEN)[:32],
+        "RRCV2_OWNER_SCOPE": "cm-" + _sha(product_token)[:32],
         "RRCV2_SMOKE_PRODUCER_ROOT": str(producer_root),
     }
     scalar_drift = sorted(
@@ -764,7 +977,7 @@ def _validated_product_environment(source: Mapping[str, str]) -> dict[str, str]:
     suffix = cell.name
     if suffix not in {"miss", "hit", "near"}:
         raise HookError("product environment cell name differs")
-    if result["RRCV2_CELL_ID"] != f"rrcv2-{_PRODUCT_ROUND}-{suffix}":
+    if result["RRCV2_CELL_ID"] != f"rrcv2-{product_round}-{suffix}":
         raise HookError("product environment cell identity differs")
     if _HEX_64.fullmatch(result["RRCV2_ROOT_PROMPT_SHA256"]) is None:
         raise HookError("product prompt hash differs")
@@ -2226,6 +2439,13 @@ def _finalize_product_root(payload: Mapping[str, Any], message: str) -> None:
     usage_row: dict[str, object] | None = None
     try:
         usage_row = _native_usage(payload, component="root")
+        transcript = _bounded_transcript(payload, component="root")
+        if _sha(transcript) != usage_row["transcript_sha256"]:
+            raise HookError("root transcript changed before durable snapshot")
+        _write_exclusive_regular(
+            Path(os.environ["RRD_TARGET_ROOT"]).parent / "root-transcript.jsonl",
+            transcript,
+        )
         _append_event("native_usage", **usage_row)
         prompt_sha256 = os.environ.get("RRCV2_ROOT_PROMPT_SHA256", "")
         if re.fullmatch(r"[0-9a-f]{64}", prompt_sha256) is None:

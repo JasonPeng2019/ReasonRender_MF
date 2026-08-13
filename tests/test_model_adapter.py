@@ -5,10 +5,87 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 from rrc.contract import ModelRole, RunContext
 from rrc.model import CodexModel, _spec_output_schema
 from rrc.pipeline.prompts import spec_prompt
 from rrc.workload import two_task_workload
+
+
+def test_codex_completion_rejects_missing_cache_write_usage(monkeypatch) -> None:
+    stdout = "\n".join(
+        (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "artifact"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 3,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 2,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 5,
+                    },
+                }
+            ),
+        )
+    )
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(ValueError, match="cache-write usage is missing"):
+        CodexModel(strong_model="test").complete(
+            ModelRole.STRONG,
+            "return an artifact",
+            RunContext("cold", "task", "owner"),
+            "spec",
+        )
+
+
+def test_codex_completion_forwards_the_explicit_closed_environment(monkeypatch) -> None:
+    stdout = "\n".join(
+        (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 3,
+                        "cached_input_tokens": 1,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 2,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 5,
+                    },
+                }
+            ),
+        )
+    )
+    expected = {"HOME": "/closed/home", "PATH": "/usr/bin:/bin"}
+
+    def fake_run(command, **kwargs):
+        assert kwargs["env"] == expected
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    completion = CodexModel(strong_model="test", environment=expected).complete(
+        ModelRole.STRONG,
+        "return an artifact",
+        RunContext("cold", "task", "owner"),
+        "metadata_fill",
+    )
+    assert completion.text == "ok"
 
 
 def test_codex_completion_ignores_workspace_rules_and_is_ephemeral(monkeypatch) -> None:
@@ -30,6 +107,7 @@ def test_codex_completion_ignores_workspace_rules_and_is_ephemeral(monkeypatch) 
                     "usage": {
                         "input_tokens": 3,
                         "cached_input_tokens": 1,
+                        "cache_write_input_tokens": 0,
                         "output_tokens": 2,
                         "reasoning_output_tokens": 1,
                         "total_tokens": 5,
@@ -96,6 +174,7 @@ def test_non_spec_completion_does_not_request_json_schema(monkeypatch) -> None:
                     "usage": {
                         "input_tokens": 1,
                         "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
                         "output_tokens": 1,
                         "reasoning_output_tokens": 0,
                         "total_tokens": 2,
@@ -154,6 +233,7 @@ def test_codex_completion_records_raw_stage_artifacts(monkeypatch, tmp_path: Pat
                     "usage": {
                         "input_tokens": 3,
                         "cached_input_tokens": 1,
+                        "cache_write_input_tokens": 1,
                         "output_tokens": 4,
                         "reasoning_output_tokens": 2,
                         "total_tokens": 7,
@@ -188,10 +268,14 @@ def test_codex_completion_records_raw_stage_artifacts(monkeypatch, tmp_path: Pat
         "stage": "implement",
         "role": "small",
         "model": "strong",
+        "requested_reasoning": "low",
+        "requested_service_tier": "priority",
         "prompt": "implement this",
         "response": "def f():\n    return 1",
+        "transcript_sha256": __import__("hashlib").sha256(stdout.encode()).hexdigest(),
         "usage": {
             "cached_input_tokens": 1,
+            "cache_write_input_tokens": 1,
             "prompt_tokens": 3,
             "completion_tokens": 4,
             "reasoning_output_tokens": 2,

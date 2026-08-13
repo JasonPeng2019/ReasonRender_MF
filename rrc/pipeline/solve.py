@@ -850,11 +850,7 @@ def _journal_completion(
     requested_reasoning = (
         "medium" if role is ModelRole.STRONG and stage in {"baseline", "cascade_strong"} else "low"
     )
-    effective_provider = (
-        completion.effective_provider
-        if completion.effective_provider != "unattested"
-        else "unattested"
-    )
+    effective_identity_attested = completion.identity_attestation == "native_complete"
     event = CostEventV1(
         cost_event_id=call_id,
         cell_id=ctx.cell_id or ("sync-" + attempt.attempt_id[:32]),
@@ -871,10 +867,16 @@ def _journal_completion(
         requested_reasoning=requested_reasoning,
         requested_service_tier="priority",
         identity_attestation=completion.identity_attestation,
-        effective_provider=effective_provider,
-        effective_model=completion.model,
-        effective_reasoning=completion.effective_reasoning,
-        effective_service_tier=completion.effective_service_tier,
+        effective_provider=(
+            completion.effective_provider if effective_identity_attested else "unattested"
+        ),
+        effective_model=completion.model if effective_identity_attested else "unattested",
+        effective_reasoning=(
+            completion.effective_reasoning if effective_identity_attested else "unattested"
+        ),
+        effective_service_tier=(
+            completion.effective_service_tier if effective_identity_attested else "unattested"
+        ),
         input_tokens=completion.usage.prompt_tokens,
         cached_input_tokens=completion.usage.cached_input_tokens,
         output_tokens=completion.usage.completion_tokens,

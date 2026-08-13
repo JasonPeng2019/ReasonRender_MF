@@ -205,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strong_model=args.strong_model,
         small_model=args.small_model,
         executable=args.codex_bin,
+        artifact_log=os.environ.get("RRC_DEMO_MODEL_EVENTS"),
     )
     product_cell_id = os.environ.get("RRCV2_CELL_ID")
     if product_cell_id:

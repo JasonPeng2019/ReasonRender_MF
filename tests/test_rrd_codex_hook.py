@@ -34,9 +34,12 @@ def _product_hook_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     hook.write_bytes((ROOT / "contextmesh/scripts/rrd_codex_hook.py").read_bytes())
     producer = (
         repo
-        / ".generated/state/rrcv2-convergence/verify/cli-smoke/rrcv2-cli-smoke-v20"
+        / f".generated/state/rrcv2-convergence/verify/cli-smoke/{guard.EXPERIMENT_ID}"
         / guard.PRODUCER_SHA256
     )
+    producer.mkdir(parents=True)
+    (producer / "producer.json").write_bytes(guard.producer_value())
+    (producer / "producer.json").chmod(0o600)
     round_root = producer / "round"
     for relative in ("tmp", "cancellation", "cancellation/children", "miss"):
         (round_root / relative).mkdir(parents=True, exist_ok=True)
@@ -319,6 +322,7 @@ def test_product_hook_rejects_unknown_prefix_and_literal_mutation_before_tool_di
         "__file__",
         str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
     )
+    environment["PATH"] = _codex_managed_path(environment)
     validated = rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
     assert "PYTHONPATH" not in validated
     assert validated["RRD_REPO_ROOT"] == environment["RRD_REPO_ROOT"]
@@ -344,6 +348,297 @@ def test_product_hook_rejects_unknown_prefix_and_literal_mutation_before_tool_di
         )
         assert completed.returncode == 0
         assert json.loads(completed.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def _codex_managed_path(environment: dict[str, str]) -> str:
+    home = Path(environment["CODEX_HOME"])
+    home.mkdir(parents=True, mode=0o700)
+    os.chmod(home, 0o700)
+    temporary = home / "tmp"
+    arg0 = temporary / "arg0"
+    volatile = arg0 / "codex-arg0Ab12Cd"
+    temporary.mkdir(mode=0o755)
+    arg0.mkdir(mode=0o700)
+    volatile.mkdir(mode=0o755)
+    release_path = Path(environment["RRD_CODEX_BIN"]).parent.parent / "codex-path"
+    return f"{volatile}:{release_path}:{environment['PATH']}"
+
+
+def test_product_environment_rejects_missing_codex_managed_path_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    with pytest.raises(rrd_codex_hook.HookError, match="PATH"):
+        rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
+
+
+def test_product_environment_accepts_only_the_pinned_codex_managed_path_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    base_path = environment["PATH"]
+    environment["PATH"] = _codex_managed_path(environment)
+
+    validated = rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
+
+    assert validated["PATH"] == base_path
+
+
+def test_product_hook_entrypoint_accepts_codex_path_and_normalizes_nested_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    base_path = environment["PATH"]
+    environment["PATH"] = _codex_managed_path(environment)
+    completed = _run_product_hook(
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "wait_agent",
+                "tool_input": {"targets": ["worker"], "timeout_ms": 10_000},
+            }
+        ).encode(),
+        environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert completed.stdout == b""
+    with monkeypatch.context() as context:
+        for name in tuple(os.environ):
+            if name.startswith(("RRD_", "RRC_", "RRCV2_")):
+                context.delenv(name, raising=False)
+        for name, value in environment.items():
+            context.setenv(name, value)
+        nested = rrd_codex_hook._sanitized_environment()  # noqa: SLF001
+    assert nested["PATH"] == base_path
+
+
+def test_product_runtime_passes_normalized_environment_to_actual_model_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    base_path = environment["PATH"]
+    environment["PATH"] = _codex_managed_path(environment)
+    captured: dict[str, object] = {}
+
+    class FakeModel:
+        product_cell_id: str | None = None
+
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(rrd_codex_hook, "SQLiteRRCRepository", lambda _path: object())
+    monkeypatch.setattr(rrd_codex_hook, "AttemptRepository", lambda _repository: object())
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "load_memory_runtime",
+        lambda *_args, **_kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(rrd_codex_hook, "CodexModel", FakeModel)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "ContextMeshController",
+        lambda **_kwargs: object(),
+    )
+    with monkeypatch.context() as context:
+        for name in tuple(os.environ):
+            if name.startswith(("RRD_", "RRC_", "RRCV2_")):
+                context.delenv(name, raising=False)
+        for name, value in environment.items():
+            context.setenv(name, value)
+        rrd_codex_hook._rrcv2_runtime()  # noqa: SLF001
+
+    model_environment = captured["environment"]
+    assert isinstance(model_environment, dict)
+    assert model_environment["PATH"] == base_path
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_volatile",
+        "reordered",
+        "extra",
+        "relative",
+        "bad_child",
+        "bad_home_mode",
+        "bad_tmp_mode",
+        "bad_volatile_mode",
+        "bad_arg0_mode",
+        "symlink_tmp",
+        "symlink_child",
+        "release_hash_drift",
+    ],
+)
+def test_product_environment_rejects_codex_path_prefix_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    environment["PATH"] = _codex_managed_path(environment)
+    parts = environment["PATH"].split(":")
+    volatile = Path(parts[0])
+    if mutation == "missing_volatile":
+        environment["PATH"] = ":".join(parts[1:])
+    elif mutation == "reordered":
+        environment["PATH"] = ":".join([parts[1], parts[0], *parts[2:]])
+    elif mutation == "extra":
+        environment["PATH"] = "/tmp/poison:" + environment["PATH"]
+    elif mutation == "relative":
+        environment["PATH"] = "relative:" + ":".join(parts[1:])
+    elif mutation == "bad_child":
+        bad = volatile.with_name("unexpected")
+        volatile.rename(bad)
+        environment["PATH"] = ":".join([str(bad), *parts[1:]])
+    elif mutation == "bad_arg0_mode":
+        os.chmod(volatile.parent, 0o755)
+    elif mutation == "bad_home_mode":
+        os.chmod(Path(environment["CODEX_HOME"]), 0o755)
+    elif mutation == "bad_tmp_mode":
+        os.chmod(volatile.parent.parent, 0o700)
+    elif mutation == "bad_volatile_mode":
+        os.chmod(volatile, 0o700)
+    elif mutation == "symlink_tmp":
+        temporary = volatile.parent.parent
+        real = temporary.with_name("real-tmp")
+        temporary.rename(real)
+        temporary.symlink_to(real, target_is_directory=True)
+    elif mutation == "symlink_child":
+        real = volatile.with_name("real-child")
+        volatile.rename(real)
+        volatile.symlink_to(real, target_is_directory=True)
+    elif mutation == "release_hash_drift":
+        monkeypatch.setattr(rrd_codex_hook, "_CODEX_PATH_RG_SHA256", "0" * 64)
+
+    with pytest.raises(rrd_codex_hook.HookError, match="PATH"):
+        rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("component", ["tmp", "arg0"])
+def test_product_environment_rejects_ancestor_substitution_during_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    environment["PATH"] = _codex_managed_path(environment)
+    volatile = Path(environment["PATH"].split(":", 1)[0])
+    original = rrd_codex_hook._open_owned_child_directory  # noqa: SLF001
+    swapped = False
+
+    def open_and_swap(parent: int, name: str, *, mode: int, label: str):
+        nonlocal swapped
+        result = original(parent, name, mode=mode, label=label)
+        if not swapped and name == ("tmp" if component == "tmp" else "arg0"):
+            target = volatile.parent.parent if component == "tmp" else volatile.parent
+            old = target.with_name(target.name + "-opened")
+            target.rename(old)
+            target.mkdir(mode=mode)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(rrd_codex_hook, "_open_owned_child_directory", open_and_swap)
+    with pytest.raises(rrd_codex_hook.HookError, match="PATH"):
+        rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("component", ["home", "volatile", "release", "release_inventory"])
+def test_product_environment_rejects_directory_mode_drift_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    from contextmesh.scripts import rrd_codex_hook
+
+    environment = _product_hook_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        rrd_codex_hook,
+        "__file__",
+        str(Path(environment["RRD_REPO_ROOT"]) / "contextmesh/scripts/rrd_codex_hook.py"),
+    )
+    environment["PATH"] = _codex_managed_path(environment)
+    volatile, release, *_ = environment["PATH"].split(":")
+    changed = False
+    if component in {"home", "volatile"}:
+        original = rrd_codex_hook._open_owned_child_directory  # noqa: SLF001
+
+        def open_and_chmod(parent: int, name: str, *, mode: int, label: str):
+            nonlocal changed
+            result = original(parent, name, mode=mode, label=label)
+            if not changed and name == Path(volatile).name:
+                os.chmod(
+                    Path(environment["CODEX_HOME"]) if component == "home" else Path(volatile),
+                    0o777,
+                )
+                changed = True
+            return result
+
+        monkeypatch.setattr(rrd_codex_hook, "_open_owned_child_directory", open_and_chmod)
+    else:
+        original_listdir = os.listdir
+        list_count = 0
+
+        def listdir_and_chmod(path: int | str | bytes | os.PathLike[str]):
+            nonlocal changed, list_count
+            result = original_listdir(path)
+            list_count += 1
+            if not changed and list_count == 1:
+                if component == "release":
+                    os.chmod(release, 0o777)
+                else:
+                    (Path(release) / "poison").write_text("changed inventory")
+                changed = True
+            return result
+
+        monkeypatch.setattr(rrd_codex_hook.os, "listdir", listdir_and_chmod)
+
+    try:
+        with pytest.raises(rrd_codex_hook.HookError, match="PATH"):
+            rrd_codex_hook._validated_product_environment(environment)  # noqa: SLF001
+    finally:
+        if component == "release":
+            os.chmod(release, 0o755)
+        elif component == "release_inventory":
+            poison = Path(release) / "poison"
+            if poison.exists():
+                poison.unlink()
 
 
 def test_product_hook_non_tool_lifecycle_exception_is_terminal_not_fail_open(

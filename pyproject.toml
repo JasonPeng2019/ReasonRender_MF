@@ -21,10 +21,12 @@ dev = [
 packages = ["rrc"]
 
 [tool.pytest.ini_options]
-addopts = ["-ra", "--strict-config", "--strict-markers"]
+addopts = ["-ra", "--strict-config", "--strict-markers", "-m", "not paid_live"]
 minversion = "8.3"
 testpaths = ["tests"]
 markers = [
+    "installed_fake_provider: exercises installed Codex against a loopback-only fake model provider",
+    "paid_live: explicitly permitted paid live-provider test excluded from default collection",
     "sandbox_real: exercises the sealed task-local Docker verifier backend",
 ]
 
