@@ -1,0 +1,12 @@
+# External DeepSeek worker profile. Qwen Code is its headless CLI transport.
+model = "deepseek-v4-flash:0731-cloud"
+model_reasoning_effort = "high"
+model_context_window = 1048576
+model_auto_compact_token_limit = 230000
+model_auto_compact_token_limit_scope = "total"
+windows_sandbox = "elevated"
+use_oss = true
+local_provider = "ollama"
+model_catalog_json = "deepseek-model-catalog.json"
+
+developer_instructions = "You are the DeepSeek V4 Flash delegated coding worker. Work only on the delegated task in the supplied workspace. End with a concise handoff: findings, files changed, and verification run."

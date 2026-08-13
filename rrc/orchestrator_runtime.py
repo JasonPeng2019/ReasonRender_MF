@@ -60,11 +60,17 @@ class OrchestratorRuntime:
         """Execute a task, bypassing the planner when a valid template is found."""
 
         case_shape = _required_case_shape(task)
+        missing_ref: str | None = None
         for external_ref, score in self._everos.search(case_shape):
             try:
                 template = self._store.get_plan_spec(external_ref)
             except (KeyError, TypeError, ValueError):
                 template = None
+            if template is None and missing_ref is None:
+                # EverOS is persistent while a demo/runtime store may be new.
+                # Rebind the first same-shape opaque ref after validating the
+                # new packet, so stale search rows cannot starve the cache.
+                missing_ref = external_ref
             if template is None or not self._matches(task, template, external_ref):
                 continue
 
@@ -88,7 +94,7 @@ class OrchestratorRuntime:
         self._policy.validate_packet(task, packet, decision)
 
         template = PlanSpecTemplate(
-            external_ref=str(uuid.uuid4()),
+            external_ref=missing_ref or str(uuid.uuid4()),
             case_shape=case_shape,
             packet=packet,
             profile=decision.profile,
@@ -108,6 +114,19 @@ class OrchestratorRuntime:
             worker_output=worker_output,
             worker_tokens=worker_tokens,
         )
+
+    def lookup_cached_template(self, task: OrchestratorTask) -> tuple[PlanSpecTemplate, float] | None:
+        """Return one validated cached template without invoking planner or worker."""
+
+        case_shape = _required_case_shape(task)
+        for external_ref, score in self._everos.search(case_shape):
+            try:
+                template = self._store.get_plan_spec(external_ref)
+            except (KeyError, TypeError, ValueError):
+                template = None
+            if template is not None and self._matches(task, template, external_ref):
+                return template, score
+        return None
 
     def _matches(
         self,
@@ -191,21 +210,32 @@ def _render_value(
 
 
 def _worker_prompt(case_shape: str, task: OrchestratorTask, template: PlanSpecTemplate) -> str:
+    return "Product worker input:\n" + json.dumps(
+        render_worker_packet(case_shape, task, template),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def render_worker_packet(
+    case_shape: str, task: OrchestratorTask, template: PlanSpecTemplate
+) -> dict[str, object]:
+    """Render one exact worker packet from a cached template and concrete task.
+
+    This is the full-arm renderer: callers receive resolved task and packet
+    values, never a generic packet accompanied by detached ``slot_values``.
+    """
+
     slot_values = task.slot_values if task.slot_values is not None else task.params
     packet = _render_value(template.packet.to_dict(), task.slot_names, slot_values)
-    payload = {
+    return {
         "task": _render_text(case_shape, task.slot_names, slot_values),
         "packet": packet,
         "profile": template.profile,
         "estimated_implementation_tokens": template.estimated_implementation_tokens,
         "packet_token_budget": template.packet_token_budget,
     }
-    return "Product worker input:\n" + json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def _result(

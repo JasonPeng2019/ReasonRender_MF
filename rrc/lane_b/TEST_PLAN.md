@@ -15,15 +15,15 @@ This is a user-authorized live test plan. It does not authorize source edits.
 
 ```text
 test orchestrator (this session): packet, supervision, final triage
-    -> one fresh Luna test executor: all live checks, one run directory, full logs
+    -> one fresh external DeepSeek test executor: all live checks, one run directory, full logs
     -> exits
 test orchestrator: read artifacts and make one pooled findings list
 ```
 
 There is no harness, nested test manager, parallel worker, or repair agent in
-this run. The executor is a fresh `gpt-5.6-luna` subagent with `xhigh`
-reasoning and priority service (the Luna fast configuration). It may write only
-under `runtime/rrc/<run-id>/`; it must not edit source or EverOS.
+this run. The executor is a fresh external `deepseek-v4-flash:0731-cloud`
+worker launched through the checked-in DeepSeek delegate workflow. It may write
+only under `runtime/rrc/<run-id>/`; it must not edit source or EverOS.
 
 ## Executor packet
 

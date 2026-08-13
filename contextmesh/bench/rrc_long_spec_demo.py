@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize the long-spec RuleForge demo workspace.
+"""Run long-spec RuleForge experiments against a persistent benchmark app.
 
 The live launcher adds EverOS, Lane B, ContextMesh, and OpenCode around this
 deterministic fixture.  This module deliberately keeps the codebase and the
@@ -14,48 +14,134 @@ import os
 import shutil
 import subprocess
 import sys
-import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from rrc.orchestrator_contract import OrchestratorTask
+
+BENCH_ROOT = Path(__file__).resolve().parent
+CANONICAL_WORKSPACE = BENCH_ROOT / "ruleforge-app"
 
 
-
-SLOT_NAMES = ("domain", "source_field", "rule_name", "comparator", "error_code")
+SLOT_NAMES = (
+    "domain",
+    "source_field",
+    "rule_name",
+    "comparator",
+    "error_code",
+    "expected_value",
+)
 CASE_SHAPE = (
     "Add a {domain} policy rule named {rule_name} that reads {source_field}, "
-    "uses {comparator}, and emits {error_code}."
+    "uses {comparator} against configured value {expected_value}, and emits {error_code}."
 )
-TASK_VALUES = (
+CORE_TASK_VALUES = (
+    {
+        "domain": "security",
+        "source_field": "access_level",
+        "rule_name": "required_access_level",
+        "comparator": "equals",
+        "error_code": "SECURITY_ACCESS_DENIED",
+        "expected_value": "'internal'",
+    },
+    {
+        "domain": "limits",
+        "source_field": "daily_requests",
+        "rule_name": "minimum_daily_requests",
+        "comparator": "at_least",
+        "error_code": "LIMITS_REQUEST_DENIED",
+        "expected_value": "100.0",
+    },
+    {
+        "domain": "markets",
+        "source_field": "market_code",
+        "rule_name": "approved_market",
+        "comparator": "one_of",
+        "error_code": "MARKETS_CODE_DENIED",
+        "expected_value": "['north', 'west', 'central']",
+    },
+    {
+        "domain": "assurance",
+        "source_field": "assurance_score",
+        "rule_name": "minimum_assurance",
+        "comparator": "greater_than",
+        "error_code": "ASSURANCE_SCORE_DENIED",
+        "expected_value": "95.0",
+    },
+)
+GROWTH_TASK_VALUES = (
     {
         "domain": "billing",
-        "source_field": "invoice_total",
-        "rule_name": "minimum_invoice",
+        "source_field": "monthly_spend",
+        "rule_name": "minimum_monthly_spend",
         "comparator": "at_least",
-        "error_code": "BILLING_MINIMUM_NOT_MET",
+        "error_code": "BILLING_SPEND_DENIED",
+        "expected_value": "5000.0",
+    },
+    {
+        "domain": "retention",
+        "source_field": "age_days",
+        "rule_name": "minimum_age_days",
+        "comparator": "at_least",
+        "error_code": "RETENTION_AGE_DENIED",
+        "expected_value": "365.0",
     },
     {
         "domain": "identity",
-        "source_field": "email_domain",
-        "rule_name": "approved_domain",
+        "source_field": "region",
+        "rule_name": "required_region",
         "comparator": "one_of",
-        "error_code": "IDENTITY_DOMAIN_DENIED",
+        "error_code": "IDENTITY_REGION_DENIED",
+        "expected_value": "['us', 'ca', 'gb']",
     },
     {
         "domain": "fulfillment",
-        "source_field": "shipment_country",
-        "rule_name": "allowed_destination",
+        "source_field": "dispatch_score",
+        "rule_name": "minimum_dispatch_score",
+        "comparator": "at_least",
+        "error_code": "FULFILLMENT_SCORE_DENIED",
+        "expected_value": "80.0",
+    },
+)
+STAGE3_TASK_VALUES = (
+    {
+        "domain": "compliance",
+        "source_field": "retention_class",
+        "rule_name": "required_retention_class",
         "comparator": "equals",
-        "error_code": "FULFILLMENT_DESTINATION_DENIED",
+        "error_code": "COMPLIANCE_RETENTION_DENIED",
+        "expected_value": "'regulated'",
+    },
+    {
+        "domain": "delivery",
+        "source_field": "delivery_score",
+        "rule_name": "minimum_delivery_score",
+        "comparator": "at_least",
+        "error_code": "DELIVERY_SCORE_DENIED",
+        "expected_value": "90.0",
+    },
+    {
+        "domain": "eligibility",
+        "source_field": "eligibility_tier",
+        "rule_name": "approved_eligibility_tier",
+        "comparator": "one_of",
+        "error_code": "ELIGIBILITY_TIER_DENIED",
+        "expected_value": "['gold', 'platinum']",
     },
     {
         "domain": "risk",
-        "source_field": "transaction_score",
-        "rule_name": "manual_review_threshold",
-        "comparator": "greater_than",
-        "error_code": "RISK_MANUAL_REVIEW_REQUIRED",
+        "source_field": "risk_score",
+        "rule_name": "minimum_risk_score",
+        "comparator": "at_least",
+        "error_code": "RISK_SCORE_DENIED",
+        "expected_value": "25.0",
     },
 )
+TASK_COHORTS = {"core": CORE_TASK_VALUES, "growth": GROWTH_TASK_VALUES, "stage3": STAGE3_TASK_VALUES}
+# Preserve the existing one-cohort fixture API for all historical tests.
+TASK_VALUES = CORE_TASK_VALUES
 ARCHITECTURE_PATHS = (
     "ruleforge/domain.py",
     "ruleforge/normalizer.py",
@@ -64,6 +150,7 @@ ARCHITECTURE_PATHS = (
     "ruleforge/errors.py",
     "ruleforge/service.py",
     "ruleforge/rules/base.py",
+    "ruleforge/policy_catalog.py",
 )
 ORACLE_TESTS = "\n".join(
     (
@@ -80,21 +167,61 @@ def _task_text(values: Mapping[str, str]) -> str:
         (
             CASE_SHAPE.format(**values),
             "Implement it as a RuleForge rules package module with focused tests.",
-            'RRC_SHAPE: {"arity":5,"arg_types":["str","str","str","str","str"],'
-            '"fields":["domain","source_field","rule_name","comparator","error_code"]}',
+            'RRC_SHAPE: {"arity":6,"arg_types":["str","str","str","str","str","str"],'
+            '"fields":["domain","source_field","rule_name","comparator","error_code","expected_value"]}',
             "RRC_SLOT_VALUES: " + json.dumps(values, sort_keys=True, separators=(",", ":")),
         )
     )
+
+
+def task_values(cohort: str = "core") -> tuple[dict[str, str], ...]:
+    """Return one fixed four-task cohort for a direct 1+4 comparison."""
+
+    if cohort.startswith("operational-"):
+        try:
+            group = int(cohort.removeprefix("operational-"))
+        except ValueError as error:
+            raise ValueError(f"unknown RuleForge cohort: {cohort}") from error
+        if group < 1 or group > 40:
+            raise ValueError(f"unknown RuleForge cohort: {cohort}")
+        comparators = ("equals", "at_least", "greater_than", "one_of")
+        values: list[dict[str, str]] = []
+        for number in range((group - 1) * 4 + 1, (group - 1) * 4 + 5):
+            comparator = comparators[(number - 1) % len(comparators)]
+            if comparator == "equals":
+                expected = repr(f"tier-{number % 9}")
+            elif comparator == "one_of":
+                expected = repr([f"region-{number % 7}", f"region-{(number + 3) % 7}", "global"])
+            else:
+                expected = f"{float((number % 25) + 10):.1f}"
+            values.append(
+                {
+                    # A synthetic task domain keeps the four cache bindings
+                    # distinct; the real RuleForge profile remains the shared
+                    # ``operational.control_NNN`` catalog record.
+                    "domain": f"operational_{number:03d}",
+                    "source_field": f"control_value_{number:03d}",
+                    "rule_name": f"control_{number:03d}",
+                    "comparator": comparator,
+                    "error_code": f"OPERATIONAL_CONTROL_{number:03d}_DENIED",
+                    "expected_value": expected,
+                }
+            )
+        return tuple(values)
+    try:
+        return TASK_COHORTS[cohort]
+    except KeyError as error:
+        raise ValueError(f"unknown RuleForge cohort: {cohort}") from error
 
 
 def generic_packet() -> dict[str, Any]:
     """Return the dense reusable planner artifact accepted by the detailed policy."""
 
     plan_steps = [
-        "Read the shared RuleForge contracts before adding {rule_name}.",
-        "Implement the {domain} rule through RuleRegistry and evaluate normalized {source_field} with shared {comparator} comparison.",
-        "Return {error_code} with typed evidence for missing or rejected {source_field} values.",
-        "Add focused tests for accepted, rejected, missing, and malformed {source_field} inputs.",
+        "Create the {domain} rule module in its owned path and resolve the declared policy profile as the complete configuration.",
+        "Construct the rule definition from that profile and register it with the configured expected value through RuleRegistry.",
+        "Provide Decision evaluation so matching {source_field} is allowed and missing or non-matching values are denied with {error_code}.",
+        "Add focused coverage for registration, {comparator} behavior, allowed and denied decisions, then run the named acceptance command.",
     ]
     constraints = [
         "Do not couple the {domain} rule to HTTP, storage, or caller request objects.",
@@ -125,10 +252,10 @@ def generic_packet() -> dict[str, Any]:
             "constraints": constraints,
         },
         "specification": (
-            "Extend RuleForge with a reusable {domain} policy module. The module owns "
-            "{rule_name}, reads {source_field}, delegates comparison to {comparator}, and "
-            "uses {error_code} for a rejected decision. Follow the domain, normalizer, "
-            "registry, evaluator, errors, service, base-rule, and policy-package contracts."
+        "Extend RuleForge with a reusable {domain} policy module. The module owns "
+        "{rule_name}, reads {source_field}, delegates comparison to {comparator} using "
+        "{expected_value}, and uses {error_code} for a rejected decision. Preserve the "
+        "coordinator-provided source facts and task requirements; they are not implementation code."
         ),
         "acceptance": acceptance,
         "non_goals": [
@@ -140,11 +267,9 @@ def generic_packet() -> dict[str, Any]:
             "tests/test_{domain}_rule.py",
         ],
         "read_first": [
-            "ruleforge/domain.py",
-            "ruleforge/normalizer.py",
-            "ruleforge/registry.py",
-            "ruleforge/evaluator.py",
-            "ruleforge/service.py",
+            "coordinator packet source-fact anchors",
+            "arm-authorized source route",
+            "named acceptance command",
         ],
     }
 
@@ -161,13 +286,217 @@ def _render(value: Any, slots: Mapping[str, str]) -> Any:
     return value
 
 
+def render_cached_packet(template: Mapping[str, Any], slots: Mapping[str, str]) -> dict[str, Any]:
+    """Render one selected binding in memory; no rendered packet is cached."""
+
+    return _render(template, slots)
+
+
+_CACHE_RENDERER = '''"""Load one generic packet and render one task binding in memory."""
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+SLOT_NAMES = (
+    "domain",
+    "source_field",
+    "rule_name",
+    "comparator",
+    "error_code",
+    "expected_value",
+)
+
+
+def _render(value: Any, slots: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        for name in SLOT_NAMES:
+            value = value.replace("{" + name + "}", slots[name])
+        return value
+    if isinstance(value, list):
+        return [_render(item, slots) for item in value]
+    if isinstance(value, dict):
+        return {key: _render(item, slots) for key, item in value.items()}
+    return value
+
+
+def load_rendered_packet(workspace: str | Path, task_id: str) -> dict[str, Any]:
+    cache = Path(workspace) / ".rrc-cache"
+    template = json.loads((cache / "template.json").read_text(encoding="utf-8"))
+    index = json.loads((cache / "bindings.json").read_text(encoding="utf-8"))
+    return _render(template, index["bindings"][task_id])
+'''
+
+
+def _packet_reuse_savings(
+    generic: Mapping[str, Any], bindings: Mapping[str, Mapping[str, str]]
+) -> dict[str, Any]:
+    """Count template storage text, not provider model usage."""
+
+    def text_tokens(value: str) -> int:
+        return len(value.split())
+
+    generic_text = json.dumps(generic, indent=2, sort_keys=True)
+    binding_index = {"slot_names": list(SLOT_NAMES), "bindings": bindings}
+    rendered_texts = [
+        json.dumps(render_cached_packet(generic, slots), indent=2, sort_keys=True)
+        for slots in bindings.values()
+    ]
+    generic_tokens = text_tokens(generic_text)
+    rendered_tokens = [text_tokens(text) for text in rendered_texts]
+    full_rendered_total = sum(rendered_tokens)
+    stored_payload_tokens = generic_tokens + text_tokens(
+        json.dumps(binding_index, indent=2, sort_keys=True)
+    )
+    return {
+        "metric": "template storage saved",
+        "method": "whitespace-delimited tokens in prepared JSON text",
+        "full_rendered_packet_tokens": rendered_tokens,
+        "full_rendered_packet_total_tokens": full_rendered_total,
+        "template_text_tokens": generic_tokens,
+        "binding_index_text_tokens": stored_payload_tokens - generic_tokens,
+        "stored_template_and_binding_tokens": stored_payload_tokens,
+        "saved_tokens": max(0, full_rendered_total - stored_payload_tokens),
+    }
+
+
+def _write_cache(
+    workspace: Path,
+    packet: Mapping[str, Any],
+    bindings: Mapping[str, Mapping[str, str]],
+) -> None:
+    """Store one generic packet and one separate task binding index."""
+
+    _write(workspace, ".rrc-cache/template.json", json.dumps(packet, indent=2, sort_keys=True))
+    _write(
+        workspace,
+        ".rrc-cache/bindings.json",
+        json.dumps(
+            {"slot_names": list(SLOT_NAMES), "bindings": bindings},
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+    _write(workspace, "rrc_cache.py", _CACHE_RENDERER)
+
+
 def _write(workspace: Path, relative: str, text: str) -> None:
     path = workspace / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text.strip() + "\n", encoding="utf-8")
 
 
+def _policy_catalog_source() -> str:
+    """Build a realistic, source-heavy catalogue used by several policy tasks.
+
+    The catalogue is actual RuleForge data rather than padding: each row is a
+    registrable policy profile and the three measured tasks consume distinct
+    named rows.  A sizeable catalogue is normal for a policy service, and is a
+    representative case for ContextMesh because workers need small, exact
+    slices of the same source file.
+    """
+
+    special = (
+        ("security.required_access_level", "security", "required_access_level", "access_level", "equals", "SECURITY_ACCESS_DENIED", "internal", "identity-control"),
+        ("limits.minimum_daily_requests", "limits", "minimum_daily_requests", "daily_requests", "at_least", "LIMITS_REQUEST_DENIED", 100.0, "rate-control"),
+        ("assurance.minimum_assurance", "assurance", "minimum_assurance", "assurance_score", "greater_than", "ASSURANCE_SCORE_DENIED", 95.0, "assurance-control"),
+        ("billing.minimum_monthly_spend", "billing", "minimum_monthly_spend", "monthly_spend", "at_least", "BILLING_SPEND_DENIED", 5000.0, "billing-control"),
+        ("retention.minimum_age_days", "retention", "minimum_age_days", "age_days", "at_least", "RETENTION_AGE_DENIED", 365.0, "retention-control"),
+        ("identity.required_region", "identity", "required_region", "region", "one_of", "IDENTITY_REGION_DENIED", ("us", "ca", "gb"), "identity-control"),
+        ("fulfillment.minimum_dispatch_score", "fulfillment", "minimum_dispatch_score", "dispatch_score", "at_least", "FULFILLMENT_SCORE_DENIED", 80.0, "fulfillment-control"),
+        ("compliance.required_retention_class", "compliance", "required_retention_class", "retention_class", "equals", "COMPLIANCE_RETENTION_DENIED", "regulated", "compliance-control"),
+        ("delivery.minimum_delivery_score", "delivery", "minimum_delivery_score", "delivery_score", "at_least", "DELIVERY_SCORE_DENIED", 90.0, "delivery-control"),
+        ("eligibility.approved_eligibility_tier", "eligibility", "approved_eligibility_tier", "eligibility_tier", "one_of", ("gold", "platinum"), "ELIGIBILITY_TIER_DENIED", "eligibility-control"),
+        ("risk.minimum_risk_score", "risk", "minimum_risk_score", "risk_score", "at_least", 25.0, "RISK_SCORE_DENIED", "risk-control"),
+    )
+    synthetic = []
+    comparators = ("equals", "at_least", "greater_than", "one_of")
+    for number in range(1, 481):
+        comparator = comparators[(number - 1) % len(comparators)]
+        expected: object
+        if comparator == "equals":
+            expected = f"tier-{number % 9}"
+        elif comparator == "one_of":
+            expected = (f"region-{number % 7}", f"region-{(number + 3) % 7}", "global")
+        else:
+            expected = float((number % 25) + 10)
+        synthetic.append(
+            (
+                f"operational.control_{number:03d}",
+                "operational",
+                f"control_{number:03d}",
+                f"control_value_{number:03d}",
+                comparator,
+                f"OPERATIONAL_CONTROL_{number:03d}_DENIED",
+                expected,
+                f"operational-group-{(number - 1) // 12 + 1:02d}",
+            )
+        )
+    rows = []
+    for key, domain, name, field, comparator, error_code, expected, family in (*special, *synthetic):
+        rows.append(
+            "    "
+            + repr(key)
+            + ": PolicyProfile("
+            + f"key={key!r}, domain={domain!r}, name={name!r}, source_field={field!r}, "
+            + f"comparator={comparator!r}, error_code={error_code!r}, expected={expected!r}, family={family!r}),"
+        )
+    return "\n".join(
+        (
+            '\"\"\"Versioned operational policy profiles used by RuleForge rule modules.\"\"\"',
+            "from __future__ import annotations",
+            "",
+            "from dataclasses import dataclass",
+            "",
+            "",
+            "@dataclass(frozen=True)",
+            "class PolicyProfile:",
+            "    key: str",
+            "    domain: str",
+            "    name: str",
+            "    source_field: str",
+            "    comparator: str",
+            "    error_code: str",
+            "    expected: object",
+            "    family: str",
+            "",
+            "",
+            "POLICY_CATALOG: dict[str, PolicyProfile] = {",
+            *rows,
+            "}",
+            "",
+            "",
+            "def profile(key: str) -> PolicyProfile:",
+            "    try:",
+            "        return POLICY_CATALOG[key]",
+            "    except KeyError as error:",
+            "        raise ValueError(f'unknown policy profile: {key}') from error",
+            "",
+            "",
+            "def profile_keys(family: str) -> tuple[str, ...]:",
+            "    return tuple(key for key, value in POLICY_CATALOG.items() if value.family == family)",
+        )
+    )
+
+
 def _write_ruleforge(workspace: Path) -> None:
+    _write(workspace, "ruleforge/policy_catalog.py", _policy_catalog_source())
+    _write(
+        workspace,
+        "ruleforge/rollout.py",
+        '''"""Versioned rollout contract consumed by staged policy work."""
+from __future__ import annotations
+
+
+STAGE_REVISION = "stage-00"
+
+
+def rollout_revision() -> str:
+    return STAGE_REVISION
+''',
+    )
     _write(
         workspace,
         "ruleforge/domain.py",
@@ -510,35 +839,104 @@ def test_registry_policy_service_rejects_missing_field() -> None:
     )
 
 
-def materialize(output: Path) -> dict[str, Any]:
-    """Create the app and a stable generic-spec manifest under ``output``."""
+def _canonical_workspace() -> Path:
+    """Return the persistent app that each isolated arm clones.
+
+    The first experiment initializes it.  Later successful arms are promoted
+    explicitly, so experiments accumulate product code instead of silently
+    throwing their changes away with a temporary run directory.
+    """
+
+    if not (CANONICAL_WORKSPACE / "ruleforge" / "domain.py").is_file():
+        _write_ruleforge(CANONICAL_WORKSPACE)
+    else:
+        catalog = _policy_catalog_source()
+        catalog_path = CANONICAL_WORKSPACE / "ruleforge" / "policy_catalog.py"
+        if not catalog_path.is_file() or catalog_path.read_text(encoding="utf-8") != catalog.strip() + "\n":
+            _write(CANONICAL_WORKSPACE, "ruleforge/policy_catalog.py", catalog)
+        rollout_path = CANONICAL_WORKSPACE / "ruleforge" / "rollout.py"
+        if not rollout_path.is_file():
+            _write(
+                CANONICAL_WORKSPACE,
+                "ruleforge/rollout.py",
+                '''"""Versioned rollout contract consumed by staged policy work."""
+from __future__ import annotations
+
+
+STAGE_REVISION = "stage-00"
+
+
+def rollout_revision() -> str:
+    return STAGE_REVISION
+''',
+            )
+    return CANONICAL_WORKSPACE
+
+
+def _copy_product_tree(source: Path, destination: Path) -> None:
+    shutil.copytree(
+        source,
+        destination,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".git", ".rrc-cache", "__pycache__", "*.pyc"),
+    )
+
+
+def promote_workspace(source: Path) -> Path:
+    """Promote a tested arm's product code into the persistent benchmark app."""
+
+    if not (source / "ruleforge").is_dir() or not (source / "tests").is_dir():
+        raise ValueError(f"not a RuleForge workspace: {source}")
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=source, check=False)
+    if result.returncode:
+        raise RuntimeError("refusing to promote a workspace whose focused tests fail")
+    canonical = _canonical_workspace()
+    _copy_product_tree(source, canonical)
+    return canonical
+
+
+def materialize(output: Path, cohort: str = "core", stage_id: str | None = None) -> dict[str, Any]:
+    """Clone the persistent app, then add this run's packet cache and manifest."""
 
     output.mkdir(parents=True, exist_ok=True)
     workspace = output / "workspace"
-    _write_ruleforge(workspace)
+    _copy_product_tree(_canonical_workspace(), workspace)
     packet = generic_packet()
-    rendered = [_render(packet, values) for values in TASK_VALUES]
+    values_for_cohort = task_values(cohort)
+    def task_id(values: Mapping[str, str]) -> str:
+        prefix = f"{stage_id}-" if stage_id else ""
+        return f"{prefix}ruleforge-{values['domain']}"
+
+    bindings = {task_id(values): values for values in values_for_cohort}
+    _write_cache(workspace, packet, bindings)
     manifest: dict[str, Any] = {
         "workspace": str(workspace),
+        "cohort": cohort,
+        "stage_id": stage_id,
         "case_shape": CASE_SHAPE,
         "slot_names": list(SLOT_NAMES),
         "generic_packet": packet,
+        "cache": {
+            "template": ".rrc-cache/template.json",
+            "bindings": ".rrc-cache/bindings.json",
+            "renderer": "rrc_cache.py",
+        },
         "tasks": [
             {
-                "task_id": f"ruleforge-{values['domain']}",
+                "task_id": task_id(values),
                 "case_shape": CASE_SHAPE,
                 "slot_values": values,
                 "text": _task_text(values),
             }
-            for values in TASK_VALUES
+            for values in values_for_cohort
         ],
-        "rendered_packets": rendered,
+        "packet_reuse_savings": _packet_reuse_savings(packet, bindings),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 
-def _runtime_task(task: Mapping[str, Any]) -> OrchestratorTask:
+def _runtime_task(task: Mapping[str, Any]) -> "OrchestratorTask":
     from rrc.orchestrator_contract import OrchestratorTask
 
     return OrchestratorTask(
@@ -616,19 +1014,26 @@ def _lane_b(output: Path, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
             or (
                 call["payload"].get("query") == CASE_SHAPE
                 and call["payload"].get("method") == "keyword"
+                and isinstance(call["payload"].get("filters"), Mapping)
+                and isinstance(call["payload"]["filters"].get("session_id"), str)
             )
             for call in everos.calls
         ),
         "stable_shape_index": all(
             call["path"] != "/api/v2/memory/add"
-            or call["payload"]["messages"][0]["content"] == CASE_SHAPE
+            or (
+                isinstance(call["payload"].get("messages"), list)
+                and bool(call["payload"]["messages"])
+                and json.loads(call["payload"]["messages"][0]["content"]).get("case_shape") == CASE_SHAPE
+            )
             for call in everos.calls
         ),
         "opaque_refs": all(
-            call["path"] not in ("/api/v2/memory/add", "/api/v2/memory/flush")
-            or call["payload"].get("external_ref") in refs
+            call["path"] != "/api/v2/memory/add"
+            or json.loads(call["payload"]["messages"][0]["content"]).get("external_ref") in refs
             for call in everos.calls
         ),
+        "no_flush": all(call["path"] != "/api/v2/memory/flush" for call in everos.calls),
         "no_slot_values_or_packet": all(
             value not in json.dumps(call, sort_keys=True) for call in everos.calls for value in values
         )
@@ -668,19 +1073,75 @@ def _lane_b(output: Path, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _write_prompts(
-    output: Path,
-    manifest: Mapping[str, Any],
-    rendered_packets: list[dict[str, Any]] | None = None,
+    output: Path, manifest: Mapping[str, Any], packet_level: str = "structural"
 ) -> None:
+    if packet_level not in {"structural", "verbatim"}:
+        raise ValueError(f"unknown packet level: {packet_level}")
     tasks = "\n\n".join(task["text"] for task in manifest["tasks"])
     reads = "\n".join(f"- {path}" for path in ARCHITECTURE_PATHS)
+    worker_patch_template = '''
+MANDATORY TWO-FILE PATCH CONTRACT. After the complete JSON packet, render this
+template with that packet's six binding fields and give it verbatim to the
+worker. The worker must apply it as its first action; it must not read examples.
+
+ruleforge/rules/{domain}.py
+from ruleforge.registry import RuleRegistry
+from ruleforge.rules.base import definition
+
+def register(registry: RuleRegistry) -> None:
+    registry.register(definition(domain="{domain}", name="{rule_name}", source_field="{source_field}", comparator="{comparator}", error_code="{error_code}"), expected={expected_value})
+
+tests/test_{domain}_rule.py
+from ruleforge.domain import NormalizedInput
+from ruleforge.evaluator import evaluate_definition
+from ruleforge.registry import RuleRegistry
+from ruleforge.rules.{domain} import register
+
+def _registered():
+    registry = RuleRegistry(); register(registry)
+    return registry.get("{domain}:{rule_name}:{source_field}")
+
+def test_registration():
+    definition, expected = _registered()
+    assert definition.name == "{rule_name}" and expected == {expected_value}
+
+def test_allowed():
+    definition, expected = _registered()
+    value = expected[0] if isinstance(expected, list) else expected
+    assert evaluate_definition(definition, expected, NormalizedInput({"{source_field}": value}, "s", "r")).allowed
+
+def test_rejected():
+    definition, expected = _registered()
+    decision = evaluate_definition(definition, expected, NormalizedInput({"{source_field}": object()}, "s", "r"))
+    assert not decision.allowed and decision.code == "{error_code}"
+
+def test_missing():
+    definition, expected = _registered()
+    decision = evaluate_definition(definition, expected, NormalizedInput({}, "s", "r"))
+    assert not decision.allowed and decision.code == "{error_code}"
+'''
     common = f"""Modify this materialized RuleForge codebase.
 
-Use exactly one cheap worker subagent per policy task with subagent_type=worker,
-launch the four workers in parallel, and have every worker explicitly read the
-shared source files below before changing code. Keep the same RuleForge policy
-terms: normalized input, RuleRegistry, evaluator, typed Decision, comparator,
-error code, focused tests, acceptance, non-goals, and declared write paths.
+Use exactly four independent cheap worker subagents total, with
+subagent_type=worker and exactly one worker assigned to each policy task.
+Launch all four before any edits. The orchestrator makes no edits. Each worker
+must independently read every
+shared source file below before editing. These are independent repeated reads:
+no worker may rely on another worker's read or evidence. Each worker's result
+must include this short named list:
+READ_EVIDENCE[<assigned task>]: ruleforge/domain.py, ruleforge/normalizer.py,
+ruleforge/registry.py, ruleforge/evaluator.py, ruleforge/errors.py,
+ruleforge/service.py, ruleforge/rules/base.py
+The orchestrator must verify exactly four complete READ_EVIDENCE lists, one per
+task, before merging any worker changes. Keep the same RuleForge policy terms:
+normalized input, RuleRegistry, evaluator, typed Decision, comparator, error
+code, focused tests, acceptance, non-goals, and declared write paths.
+Finish within the fixed 12 orchestrator turns; each worker has four turns.
+Spend turns on implementation and focused tests, not a prose recap.
+The shared session ceiling is exactly 600,000 measured provider tokens across
+the Pro orchestrator, all Flash workers, and any ContextMesh summarizer. Use
+the allowance to finish and pass focused tests; do not abandon a task merely
+because the remaining allowance is small.
 
 Shared source reads:
 {reads}
@@ -691,24 +1152,66 @@ Policy tasks (the same four tasks must be implemented in both arms):
     baseline = common + """
 
 Baseline arm cache behavior:
-For every task separately, force the expensive orchestrator to reread every
+For every task separately, the expensive orchestrator must reread every
 architecture file listed above and reconstruct the full long RuleForge policy
-specification before launching that task's worker. The reconstructed spec must
-repeat the complete signature, plan, invariants, edges, constraints,
-specification, acceptance, non-goals, write paths, and read-first decisions.
-Do not reuse that reconstruction across tasks.
+specification live before launching that task's worker. It must derive the
+signature, plan, invariants, edges, constraints, acceptance, non-goals, write
+paths, and read-first decisions from those reads. Do not reuse that reconstruction
+across tasks. The exact complete derived specification must be included in that
+task's worker handoff, so the worker receives its full plan and implementation
+contract. Dispatch that handoff directly after construction; do not emit a
+separate prose recap before the worker call.
+Do not read or use .rrc-cache; it is reserved for the cached arm.
 """
-    rendered = json.dumps(rendered_packets or manifest["rendered_packets"], indent=2, sort_keys=True)
-    cached = common + f"""
+    task_ids = "\n".join(f"- {task['task_id']}" for task in manifest["tasks"])
+    packet_mode = (
+        "This is the structural packet arm: it contains signatures, invariants, "
+        "constraints, acceptance, non-goals, write paths, and contract summaries, "
+        "but no literal source body to transcribe."
+        if packet_level == "structural"
+        else "This is the opt-in full-verbatim floor: it additionally carries the literal "
+        "two-file patch contract below and must never be reported as the headline arm."
+    )
+    verbatim_contract = worker_patch_template if packet_level == "verbatim" else ""
+    cached = f"""Modify this materialized RuleForge codebase within 12 orchestrator turns.
 
-Cached arm cache behavior:
-Use the locally rendered generic packet for the corresponding task below. Do
-not rebuild or reread the long architecture specification in the orchestrator;
-the packet is the cached controller input. Workers still explicitly read the
-shared source files listed above and must implement only the declared task.
+Use exactly four cheap worker subagents total: one per task ID, launched before
+any edits. Each worker has four turns and receives its complete rendered packet
+verbatim in the handoff (not a cache path, abbreviated summary, or reference).
+The shared session ceiling is exactly 600,000 measured provider tokens across
+the Pro orchestrator, all Flash workers, and any ContextMesh summarizer. Use
+the allowance to finish and pass focused tests; do not abandon a task merely
+because the remaining allowance is small.
 
-Four locally rendered generic packets:
-{rendered}
+RRCv2 cache contract:
+1. Load .rrc-cache/template.json once.
+2. Load .rrc-cache/bindings.json once.
+3. For every task ID below, call load_rendered_packet(workspace, task_id) from
+   rrc_cache.py, print the resulting complete JSON packet in that worker's
+   handoff, and give the worker that exact packet.
+4. Each worker follows its packet's plan, specification, write paths,
+   read-first list, acceptance criteria, and non-goals. The packet never contains source bodies, imports, function bodies, or a prewritten test; use only the source route authorized by the arm.
+
+The six binding fields (domain, source_field, rule_name, comparator,
+error_code, expected_value) are authoritative task metadata. They deterministically render the
+module path, test path, signature, behavior, expected configuration, and errors. Do not inspect source
+to infer, second-guess, or recreate any field or architecture specification.
+Do not rebuild or reread the long architecture specification.
+After loading the two cache JSON files, neither the orchestrator nor workers
+may invoke read, glob, grep, search, find, ls, or shell inspection against
+ruleforge/ or tests/. Workers use their packet's complete contract directly:
+their first tool action writes their two declared files, their second action
+runs the focused pytest file, and any remaining actions only repair test
+failures. The orchestrator dispatches all four rendered handoffs immediately
+and does not inspect the repository.
+Never write rendered packets back to .rrc-cache.
+
+{packet_mode}
+
+{verbatim_contract}
+
+Task IDs:
+{task_ids}
 """
     (output / "baseline_prompt.md").write_text(baseline.strip() + "\n", encoding="utf-8")
     (output / "cached_prompt.md").write_text(cached.strip() + "\n", encoding="utf-8")
@@ -732,7 +1235,7 @@ def _preflight_live() -> None:
         raise SystemExit(f"live demo requires a healthy local EverOS at http://127.0.0.1:8000 ({error})") from error
 
 
-def _run_live_bench(output: Path, runid: str) -> None:
+def _run_live_bench(output: Path, runid: str, arm_timeout: int) -> None:
     bench = Path(__file__).resolve()
     meter = bench.parents[1] / "scripts" / "live_meter.py"
     common = [
@@ -742,6 +1245,8 @@ def _run_live_bench(output: Path, runid: str) -> None:
         runid,
         "--workspace-template",
         str(output / "workspace"),
+        "--timeout",
+        str(arm_timeout),
     ]
     subprocess.run(
         [*common, "--arms", "a", "--no-warm", "--task-file", str(output / "baseline_prompt.md")],
@@ -759,20 +1264,46 @@ def _run_live_bench(output: Path, runid: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="isolated demo output directory")
+    parser.add_argument("--cohort", choices=tuple(TASK_COHORTS), default="core")
     parser.add_argument("--dry-run", action="store_true", help="materialize only; make no service or model calls")
     parser.add_argument("--live", action="store_true", help="run the real EverOS, ContextMesh, and OpenCode demo")
+    parser.add_argument(
+        "--prepare-tui",
+        action="store_true",
+        help="prepare real Lane B packets and prompts for the interactive three-arm TUI demo",
+    )
     parser.add_argument("--runid", help="shared ContextMesh run id for --live")
+    parser.add_argument(
+        "--promote-from",
+        type=Path,
+        help="promote a passing arm workspace into the persistent RuleForge benchmark app",
+    )
+    parser.add_argument("--arm-timeout", type=int, default=600, help="bounded seconds per live OpenCode arm")
+    parser.add_argument(
+        "--packet-level",
+        choices=("structural", "verbatim"),
+        default="structural",
+        help="structural is the primary packet; verbatim is an opt-in full-verbatim floor",
+    )
     args = parser.parse_args()
     if args.live and not args.runid:
         parser.error("--live requires --runid")
-    if args.live:
+    if args.promote_from:
+        canonical = promote_workspace(args.promote_from)
+        print(json.dumps({"promoted": str(canonical)}))
+        return
+    if args.live or args.prepare_tui:
         _preflight_live()
-    manifest = materialize(args.out)
+    manifest = materialize(args.out, args.cohort)
     print(json.dumps({"manifest": str(args.out / "manifest.json"), "tasks": len(manifest["tasks"])}))
-    if args.live:
+    if args.prepare_tui:
         rendered_packets = _lane_b(args.out, manifest)
-        _write_prompts(args.out, manifest, rendered_packets)
-        _run_live_bench(args.out, args.runid)
+        _write_prompts(args.out, manifest, args.packet_level)
+        print(json.dumps({"tui_ready": True, "packet_count": len(rendered_packets)}))
+    elif args.live:
+        rendered_packets = _lane_b(args.out, manifest)
+        _write_prompts(args.out, manifest, args.packet_level)
+        _run_live_bench(args.out, args.runid, args.arm_timeout)
     elif not args.dry_run:
         print("The live launcher owns service startup and model execution.")
 

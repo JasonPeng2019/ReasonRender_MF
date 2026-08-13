@@ -24,7 +24,7 @@ rrc/
 ├── run.py                      # Lane B: cold/warm arm runner, local metrics, CLI entry point.
 ├── sink.py                     # Lane B: Snowflake per-task inserts and optional curve query.
 └── lane_b/                     # Lane B implementation documentation; no runtime code.
-    ├── Workflow.md             # Fresh-Luna-per-task workflow; serial by default.
+    ├── Workflow.md             # Fresh external-DeepSeek-worker workflow; serial by default.
     ├── SUBAGENT_PROTOCOL.md    # Bounded plan/spec/read-list packet and result format.
     ├── SHAVE_IF_LOW_TIME.md    # Required two-hour scope-cut list for incomplete work.
     └── PLAN.md                 # Four-hour milestones, scope cuts, and handoff checks.
@@ -65,4 +65,4 @@ runtime/rrc/<run-id>/           # Ignored JSONL, response evidence, CSV, and run
 - Tests use fakes or recorded external responses by default. Live Codex,
   EverOS, and Snowflake checks are explicit smoke runs and write only to
   `runtime/rrc/<run-id>/`. They are user-authorized validation work; the
-  coding orchestrator and Luna coding subagents do not launch them.
+  coding orchestrator and external DeepSeek workers do not launch them.

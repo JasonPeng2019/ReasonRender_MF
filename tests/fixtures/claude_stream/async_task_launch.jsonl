@@ -1,0 +1,4 @@
+{"type":"assistant","session_id":"parent","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1},"content":[]}}
+{"type":"user","tool_use_result":{"agentId":"async-child","isAsync":true,"status":"async_launched"}}
+{"type":"user","tool_use_result":"ordinary string result"}
+{"type":"result","subtype":"success","session_id":"parent"}

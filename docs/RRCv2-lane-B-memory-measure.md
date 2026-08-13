@@ -68,8 +68,8 @@ of scope; it may later replace the index track without changing the
 
 ## Execution topology
 
-Use one expensive coding orchestrator and a fresh `luna-xhigh-fast` coding
-subagent for each bounded code change. Exactly one is active by default. This
+Use the project coding orchestrator and a fresh external DeepSeek V4 Flash
+worker for each bounded code change. Exactly one is active by default. This
 coding loop reads plans and files, writes code, and reviews diffs only. It does
 not call EverOS, run tests, invoke a real model/subagent, start the RRC runner,
 or write to Snowflake. The coding orchestrator is not the runtime identity that
@@ -85,8 +85,9 @@ automatically. The operating contract is
 
 Every coding task finishes with a result and the model continues. Orchestrator,
 workflow, packet, process-scaffold, tool, and evidence-collection errors are
-non-blocking coding errors: record them, use a minimal direct fallback, and
-continue the next useful coding slice. The coding loop does not run tests.
+non-blocking coding errors: record them, repair the delegated packet or
+scaffold as needed, and continue the next useful worker slice. The coding loop
+does not run tests.
 
 Only user-authorized real validation can establish a product defect. A test or
 process failure alone is test-infrastructure evidence. A defect is confirmed

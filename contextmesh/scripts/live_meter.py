@@ -78,6 +78,72 @@ def totals(runid: str | None = None) -> dict[str, dict[str, int]]:
     return out
 
 
+def three_arm_totals() -> dict[str, dict[str, int]]:
+    """Read the isolated sessions used by the interactive three-arm demo."""
+    out = {
+        "raw": {"input": 0, "output": 0, "requests": 0},
+        "contextmesh": {"input": 0, "output": 0, "requests": 0},
+        "full": {"input": 0, "output": 0, "requests": 0},
+        "contextmesh-summarizer": {"input": 0, "output": 0, "requests": 0},
+        "full-summarizer": {"input": 0, "output": 0, "requests": 0},
+    }
+    if not TOKENS.exists():
+        return out
+    keymap = {
+        f"demo-{ROUND}-raw": "raw",
+        f"demo-{ROUND}-contextmesh": "contextmesh",
+        f"demo-{ROUND}-full": "full",
+        f"demo-{ROUND}-contextmesh-summarizer": "contextmesh-summarizer",
+        f"demo-{ROUND}-full-summarizer": "full-summarizer",
+    }
+    for line in TOKENS.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = keymap.get(record.get("session") or "")
+        if not key or record.get("measurement_state") != "exact":
+            continue
+        out[key]["input"] += record.get("input_tokens") or 0
+        out[key]["output"] += record.get("output_tokens") or 0
+        out[key]["requests"] += 1
+    return out
+
+
+def three_arm_model_totals() -> dict[str, dict[str, int]]:
+    """Split each arm's exact usage into Pro/orchestrator and cheap-worker spend."""
+
+    out = {
+        arm: {
+            "expensive_input": 0,
+            "expensive_output": 0,
+            "cheap_input": 0,
+            "cheap_output": 0,
+        }
+        for arm in ("raw", "contextmesh", "full")
+    }
+    if not TOKENS.exists():
+        return out
+    prefix = f"demo-{ROUND}-"
+    for line in TOKENS.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session = record.get("session")
+        if not isinstance(session, str) or not session.startswith(prefix):
+            continue
+        arm = session.removeprefix(prefix).removesuffix("-summarizer")
+        if arm not in out or record.get("measurement_state") != "exact":
+            continue
+        # The title agent is explicitly pinned to the same Pro model, so its
+        # small requests belong with orchestration rather than cheap workers.
+        tier = "expensive" if record.get("model") == "deepseek-v4-pro" else "cheap"
+        out[arm][f"{tier}_input"] += record.get("input_tokens") or 0
+        out[arm][f"{tier}_output"] += record.get("output_tokens") or 0
+    return out
+
+
 def digest_stats(runid: str | None = None) -> dict[str, int]:
     stats = {"digest_hit": 0, "digest_stored": 0, "escape_hatch": 0, "reread_blocked": 0, "task_compressed": 0, "saved_tokens": 0}
     metrics_path = CM / "runs" / runid / "b-warm" / "metrics.jsonl" if runid else METRICS_B
@@ -93,6 +159,38 @@ def digest_stats(runid: str | None = None) -> dict[str, int]:
             if ev == "digest_hit":
                 stats["saved_tokens"] += d.get("savedTokens", 0)
     return stats
+
+
+def _empty_digest_stats() -> dict[str, int]:
+    return {
+        "digest_hit": 0,
+        "digest_stored": 0,
+        "escape_hatch": 0,
+        "reread_blocked": 0,
+        "task_compressed": 0,
+        "saved_tokens": 0,
+    }
+
+
+def three_arm_digest_stats() -> dict[str, dict[str, int]]:
+    """Read each ContextMesh arm's own metrics stream for the active round."""
+    out = {"contextmesh": _empty_digest_stats(), "full": _empty_digest_stats()}
+    for arm, stats in out.items():
+        metrics_path = CM / "runs" / "demo-tui" / ROUND / arm / "metrics.jsonl"
+        if not metrics_path.exists():
+            continue
+        for line in metrics_path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = event.get("event")
+            if name in stats:
+                stats[name] += 1
+            saved = event.get("savedTokens")
+            if isinstance(saved, (int, float)):
+                stats["saved_tokens"] += max(0, int(saved))
+    return out
 
 
 WIDTH = 84
@@ -156,10 +254,59 @@ def render(
     return "\n".join(lines)
 
 
+def render_three_arm(t0: dict | None = None, d0: dict | None = None) -> str:
+    """Render the actual three comparison arms used by demo_tui.sh."""
+    values = three_arm_totals()
+    model_values = three_arm_model_totals()
+    digests = three_arm_digest_stats()
+    if t0:
+        values = subtract(values, t0)
+    if d0:
+        digests = subtract(digests, d0)
+
+    combined_contextmesh = {
+        key: values["contextmesh"][key] + values["contextmesh-summarizer"][key]
+        for key in ("input", "output", "requests")
+    }
+    combined_full = {
+        key: values["full"][key] + values["full-summarizer"][key]
+        for key in ("input", "output", "requests")
+    }
+    raw_total = values["raw"]["input"] + values["raw"]["output"]
+    contextmesh_total = combined_contextmesh["input"] + combined_contextmesh["output"]
+    full_total = combined_full["input"] + combined_full["output"]
+    contextmesh_source_saved = digests["contextmesh"]["saved_tokens"]
+    full_source_saved = digests["full"]["saved_tokens"]
+
+    columns = ("RAW", "RAW + CONTEXTMESH", "CONTEXTMESH + RRCv2")
+    rows = (
+        ("requests", values["raw"]["requests"], combined_contextmesh["requests"], combined_full["requests"]),
+        ("input tokens", values["raw"]["input"], combined_contextmesh["input"], combined_full["input"]),
+        ("output tokens", values["raw"]["output"], combined_contextmesh["output"], combined_full["output"]),
+        ("tokens used", raw_total, contextmesh_total, full_total),
+        ("Pro / orchestrator", *(model_values[arm]["expensive_input"] + model_values[arm]["expensive_output"] for arm in ("raw", "contextmesh", "full"))),
+        ("Flash / cheap", *(model_values[arm]["cheap_input"] + model_values[arm]["cheap_output"] for arm in ("raw", "contextmesh", "full"))),
+        ("source tokens replaced", 0, contextmesh_source_saved, full_source_saved),
+    )
+    width = 108
+    lines = ["+" + (f" Three-arm live token meter - round {ROUND} ").center(width - 2, "-") + "+"]
+    lines.append("| " + f"{'':<18}{columns[0]:>16}{columns[1]:>28}{columns[2]:>32}" + " |")
+    lines.append("|" + "-" * (width - 2) + "|")
+    for label, raw, contextmesh, full in rows:
+        lines.append("| " + f"{label:<18}{raw:>16,}{contextmesh:>28,}{full:>32,}" + " |")
+    lines.append("|" + "-" * (width - 2) + "|")
+    lines.append("| " + "source saved = sum of savedTokens in each arm's own ContextMesh metrics.jsonl.".ljust(width - 4) + " |")
+    lines.append("| " + "source tokens replaced is an observed ContextMesh metric; it is not added to or subtracted from billed usage.".ljust(width - 4) + " |")
+    lines.append("| " + "tokens used = exact Tollgate input + output; ContextMesh columns include their summarizer.".ljust(width - 4) + " |")
+    lines.append("+" + "-" * (width - 2) + "+")
+    return "\n".join(lines)
+
+
 def main() -> None:
     # Default: show deltas since the meter was launched, so each rehearsal
     # starts from zero. --absolute shows all-time totals for the sessions.
     absolute = "--absolute" in sys.argv
+    three_arm = "--three-arm" in sys.argv
     runid = None
     if "--runid" in sys.argv:
         try:
@@ -167,13 +314,21 @@ def main() -> None:
         except IndexError:
             raise SystemExit("--runid requires a value")
     if "--once" in sys.argv:
+        if three_arm:
+            print(render_three_arm())
+            return
         print(render(runid=runid))  # one absolute snapshot
         return
-    t0 = None if absolute else totals(runid)
-    d0 = None if absolute else digest_stats(runid)
+    if three_arm:
+        t0 = None if absolute else three_arm_totals()
+        d0 = None if absolute else three_arm_digest_stats()
+    else:
+        t0 = None if absolute else totals(runid)
+        d0 = None if absolute else digest_stats(runid)
     try:
         while True:
-            print("\033[2J\033[H" + render(runid=runid, t0=t0, d0=d0), flush=True)
+            view = render_three_arm(t0=t0, d0=d0) if three_arm else render(runid=runid, t0=t0, d0=d0)
+            print("\033[2J\033[H" + view, flush=True)
             time.sleep(2)
     except KeyboardInterrupt:
         pass

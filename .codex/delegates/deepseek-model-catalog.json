@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "slug": "deepseek-v4-flash:0731-cloud",
+      "display_name": "DeepSeek V4 Flash (Ollama Cloud)",
+      "base_instructions": "",
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "default_verbosity": "low",
+      "shell_type": "default",
+      "priority": 0,
+      "experimental_supported_tools": [],
+      "support_verbosity": true,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [],
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "input_modalities": ["text"],
+      "truncation_policy": {"mode": "tokens", "limit": 10000},
+      "visibility": "list"
+    }
+  ]
+}

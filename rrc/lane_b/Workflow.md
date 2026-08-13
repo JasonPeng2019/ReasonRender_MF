@@ -2,20 +2,20 @@
 
 ## Coding topology — not the product runtime
 
-Use one expensive **coding orchestrator** and a fresh `luna-xhigh-fast`
-**coding subagent** for each bounded coding task. The default is exactly one
-active subagent. Do not use a multi-agent harness or specialist review/test
+Use the project **coding orchestrator** and a fresh external DeepSeek V4 Flash
+**coding worker** for each bounded coding task. The default is exactly one
+active worker. Do not use a multi-agent harness or specialist review/test
 agents.
 
 ```text
 coding orchestrator (plans, scopes, reviews code)
-    -> fresh Luna coding subagent (reads and edits only)
+    -> fresh external DeepSeek coding worker (reads and edits only)
     -> structured code-result packet
     -> agent exits; orchestrator approves or sends the next coding packet
 ```
 
-This loop is for code changes only. Neither the coding orchestrator nor Luna
-calls EverOS, runs tests, starts the RRC runner, invokes a real model/subagent,
+This loop is for code changes only. Neither the coding orchestrator nor the
+external DeepSeek worker calls EverOS, runs tests, starts the RRC runner, invokes a real model/subagent,
 or performs product validation. They review plans and diffs only. The coding
 orchestrator is not the RRC runtime identity described below.
 
@@ -27,8 +27,8 @@ implementation spec, explicit write paths, and at most five initial files.
 
 Every coding task returns a result. Orchestrator, packet, process-scaffold,
 tool, or evidence-collection errors are non-blocking operational errors:
-record them, use the smallest direct coding fallback, and send the next useful
-coding packet. They never stop the model.
+record them, repair the delegated packet or scaffold as needed, and send the
+next useful coding packet. They never stop the model.
 
 A coding review can report a possible product risk, but cannot call it a
 confirmed Lane B defect because it does not execute the product. Real tests
@@ -53,8 +53,8 @@ not product defects.
 Stay serial until the coding orchestrator explicitly declares `Execution mode:
 parallel` in task packets. It may do so only for disjoint write paths,
 independent acceptance criteria, no shared runtime state, and a defined
-integration order. Each parallel task still gets a fresh small-context Luna
-subagent. Otherwise the next coding subagent starts only after code review.
+integration order. Each parallel task still gets a fresh external DeepSeek
+worker. Otherwise the next coding worker starts only after code review.
 
 ## Product architecture being coded
 
@@ -78,7 +78,7 @@ contract, tests, and slot schema, not a rendered task instance.
 ## Runtime EverOS boundaries
 
 These identifiers belong to the future product runtime, not to the coding
-orchestrator or Luna:
+orchestrator or external DeepSeek worker:
 
 ```text
 RRC case index: app=reasonrender, project=rrc-template-index,
@@ -95,11 +95,11 @@ subagent receives only its selected template/spec, never a general EverOS dump.
 
 ## Coding slice sequence
 
-1. Luna edits the EverOS metadata-path source and prepares its validation
+1. The external DeepSeek worker edits the EverOS metadata-path source and prepares its validation
    handoff; it does not start EverOS or run the patch test.
-2. Luna implements the SQLite store and retrieval join from the supplied
+2. The external DeepSeek worker implements the SQLite store and retrieval join from the supplied
    contract/spec; it does not run the round trip.
-3. Luna implements the structured workload, runner, and model adapter; it does
+3. The external DeepSeek worker implements the structured workload, runner, and model adapter; it does
    not invoke a model, solver, test runner, or Snowflake.
 4. The coding orchestrator reviews the completed diffs and stops at the user
    test gate with the proposed validation sequence.

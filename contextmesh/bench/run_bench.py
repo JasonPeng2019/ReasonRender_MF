@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -156,11 +157,16 @@ def run_arm(
     print(f"[{label}] starting (session={session})")
     started = time.time()
     with open(rundir / "events.ndjson", "wb") as out, open(rundir / "run.log", "wb") as errlog:
-        proc = subprocess.Popen(cmd, cwd=workspace, env=env, stdout=out, stderr=errlog)
+        proc = subprocess.Popen(cmd, cwd=workspace, env=env, stdout=out, stderr=errlog, start_new_session=True)
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
             code = -9
     wall = round(time.time() - started, 1)
     print(f"[{label}] finished in {wall}s (exit {code})")

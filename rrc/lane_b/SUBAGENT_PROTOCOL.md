@@ -2,13 +2,13 @@
 
 ## Roles
 
-- **Coding orchestrator:** owns coding slice order, scope, and code review.
+- **Coding orchestrator:** owns coding slice order, scope, and integration decisions.
   It is not the RRC runtime and does not use EverOS or execute tests.
-- **`luna-xhigh-fast` coding subagent:** a fresh worker for one coding task. It
+- **External DeepSeek V4 Flash coding worker:** a fresh worker for one coding task. It
   reads the supplied files, edits code, returns a code-result packet, and exits.
 
-No harness manages workers. Normal mode is serial: one active coding subagent,
-code review, then a new fresh subagent. No real test or runtime subagent is
+No harness manages workers. Normal mode is serial: one active coding worker,
+integration review, then a new fresh worker. No real test or runtime subagent is
 selected by this protocol.
 
 ## Required coding packet
@@ -63,7 +63,7 @@ User test handoff: <none, or proposed live checks/services/cost>
 Recommended next coding slice: <one sentence; orchestrator decides>
 ```
 
-The coding orchestrator reviews the diff and either sends another coding packet
+The coding orchestrator reviews the handoff and integration result and either sends another coding packet
 or returns `ready_for_user_test`. It never converts an untested risk into a
 product-defect claim and never launches a real test automatically.
 
@@ -71,7 +71,7 @@ product-defect claim and never launches a real test automatically.
 
 The coding orchestrator may set `Execution mode: parallel` only for tasks with
 disjoint write paths, independent acceptance criteria, no shared runtime state,
-and a stated integration order. Each task still gets a fresh Luna subagent and
+and a stated integration order. Each task still gets a fresh external DeepSeek worker and
 a small packet. Otherwise coding remains serial.
 
 ## Curated read-list examples

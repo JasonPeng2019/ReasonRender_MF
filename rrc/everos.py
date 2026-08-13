@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import urllib.request
-import uuid
 from typing import Any
 
 
@@ -18,9 +18,20 @@ class EverOSClient:
     TOP_K = 3
     MIN_SCORE = 0.3
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8000", timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8000",
+        timeout: float = 30.0,
+        *,
+        app_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._app_id = app_id or self.APP_ID
+        self._project_id = project_id or self.PROJECT_ID
+        self._user_id = user_id or self.USER_ID
 
     def _get(self, path: str, *, timeout: float | None = None) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -78,35 +89,35 @@ class EverOSClient:
             time.sleep(min(max(poll_interval, 0.0), remaining))
 
     def index(self, case_shape: str, external_ref: str) -> None:
-        """Index only a stable case shape and its SQLite correlation ref."""
+        """Park one stable-key buffer without invoking EverOS extraction."""
 
-        session_id = str(uuid.uuid4())
-        self._post(
+        session_id = _session_id(case_shape)
+        response = self._post(
             "/api/v2/memory/add",
             {
                 "session_id": session_id,
-                "external_ref": external_ref,
-                "app_id": self.APP_ID,
-                "project_id": self.PROJECT_ID,
+                "app_id": self._app_id,
+                "project_id": self._project_id,
                 "messages": [
                     {
-                        "role": "user",
-                        "sender_id": self.USER_ID,
+                        # This is EverOS's exact-key path: assistant buffers
+                        # remain unprocessed until a caller flushes them. RRC
+                        # never flushes, so EverOS never invokes its LLM.
+                        "role": "assistant",
+                        "sender_id": self._user_id,
                         "timestamp": int(time.time() * 1000),
-                        "content": case_shape,
+                        "content": json.dumps(
+                            {"schema_version": 1, "case_shape": case_shape, "external_ref": external_ref},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
                     }
                 ],
             },
         )
-        self._post(
-            "/api/v2/memory/flush",
-            {
-                "session_id": session_id,
-                "external_ref": external_ref,
-                "app_id": self.APP_ID,
-                "project_id": self.PROJECT_ID,
-            },
-        )
+        status = response.get("data", {}).get("status") if isinstance(response, dict) else None
+        if status != "accumulated":
+            raise ValueError(f"EverOS did not park the RRC exact-key buffer: {status!r}")
 
     def search(
         self,
@@ -120,25 +131,34 @@ class EverOSClient:
         response = self._post(
             "/api/v2/memory/search",
             {
-                "user_id": self.USER_ID,
-                "app_id": self.APP_ID,
-                "project_id": self.PROJECT_ID,
+                "user_id": self._user_id,
+                "app_id": self._app_id,
+                "project_id": self._project_id,
                 "query": case_shape,
                 "method": "keyword",
+                "filters": {"session_id": _session_id(case_shape)},
                 "top_k": self.TOP_K if top_k is None else top_k,
                 "min_score": self.MIN_SCORE if min_score is None else min_score,
             },
         )
-        episodes = response.get("data", {}).get("episodes", [])
+        messages = response.get("data", {}).get("unprocessed_messages", [])
         candidates: list[tuple[str, float]] = []
-        for episode in episodes:
-            external_ref = episode.get("external_ref")
-            score = episode.get("score")
-            if (
-                isinstance(external_ref, str)
-                and external_ref.strip()
-                and isinstance(score, (int, float))
-                and not isinstance(score, bool)
-            ):
-                candidates.append((external_ref, float(score)))
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            try:
+                payload = json.loads(message.get("content", ""))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            external_ref = payload.get("external_ref")
+            if payload.get("case_shape") == case_shape and isinstance(external_ref, str) and external_ref.strip():
+                candidates.append((external_ref, 1.0))
         return candidates
+
+
+def _session_id(case_shape: str) -> str:
+    """Derive the opaque EverOS buffer key from the public stable case shape."""
+
+    return "rrc:" + hashlib.sha256(case_shape.encode("utf-8")).hexdigest()

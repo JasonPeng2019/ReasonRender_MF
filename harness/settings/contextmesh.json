@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/harness/hooks/completion_gate.py\" --manifest \"$REASONRENDER_GATE_MANIFEST\" --state-dir \"$REASONRENDER_GATE_STATE_DIR\" --log-path \"$REASONRENDER_GATE_LOG_PATH\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/harness/hooks/block_bash_reads.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

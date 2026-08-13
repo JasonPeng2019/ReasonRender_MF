@@ -17,6 +17,15 @@ htmlcov/
 .agent-workspace/
 .claude/
 .codex/
+!.codex/
+/.codex/*
+!.codex/delegates/
+/.codex/delegates/*
+!.codex/delegates/deepseek.toml
+!.codex/delegates/deepseek-model-catalog.json
+!.codex/scripts/
+/.codex/scripts/*
+!.codex/scripts/Invoke-DeepSeekDelegate.ps1
 .generated/
 .vscode/
 CLAUDE.local.md
@@ -29,8 +38,16 @@ HANDOFF.md
 CLAUDE.local.md.pre-attach.bak
 
 # Local harness checkout
-/harness/
 /harness-irrelevant/
+
+# Generated harness evidence and local execution state. These trees contain
+# retained provider homes with paths beyond Windows Git's index limit; source
+# and focused tests live outside them.
+/metrics/
+/metrics-provider-smoke/
+/.scratch/
+/.tools/
+/harness/artifacts/
 
 # Lane B local configuration and run evidence
 /local-config/rrc/

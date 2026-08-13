@@ -4,7 +4,7 @@ from typing import Any
 from rrc.everos import EverOSClient
 from rrc.orchestrator_contract import OrchestratorTask, PlanSpecPacket
 from rrc.orchestrator_policy import POLICY
-from rrc.orchestrator_runtime import OrchestratorRuntime
+from rrc.orchestrator_runtime import OrchestratorRuntime, render_worker_packet
 from rrc.store import SQLiteTemplateStore
 
 
@@ -42,12 +42,25 @@ class FakeCaseIndex(EverOSClient):
         self.posts.append((path, payload))
         self.events.append("everos:" + path)
         if path == "/api/v2/memory/add":
-            external_ref = payload.get("external_ref")
+            messages = payload.get("messages")
+            assert isinstance(messages, list) and messages
+            external_ref = json.loads(messages[0]["content"])["external_ref"]
             assert isinstance(external_ref, str)
             self.indexed_ref = external_ref
-            return {}
+            return {"data": {"status": "accumulated"}}
         if path == "/api/v2/memory/search" and self.indexed_ref is not None:
-            return {"data": {"episodes": [{"external_ref": self.indexed_ref, "score": 0.91}]}}
+            assert isinstance(payload.get("filters"), dict)
+            return {
+                "data": {
+                    "unprocessed_messages": [
+                        {
+                            "content": json.dumps(
+                                {"schema_version": 1, "case_shape": payload["query"], "external_ref": self.indexed_ref}
+                            )
+                        }
+                    ]
+                }
+            }
         return {}
 
 
@@ -151,10 +164,16 @@ def test_lean_miss_hit_privacy_and_everos_boundary(tmp_path) -> None:
     assert (
         events.index("worker") < events.index("store") < events.index("everos:/api/v2/memory/add")
     )
-    assert events.index("everos:/api/v2/memory/add") < events.index("everos:/api/v2/memory/flush")
+    assert "everos:/api/v2/memory/flush" not in events
     stored = store.get_plan_spec(miss.external_ref)
     assert stored is not None
     assert stored.packet == packet
+    rendered = render_worker_packet(case_shape, task_one, stored)
+    rendered_json = json.dumps(rendered, sort_keys=True)
+    assert "slot_values" not in rendered
+    assert "{source}" not in rendered_json
+    for value in first_values.values():
+        assert value in rendered_json
 
     planner_prompt = planner.calls[0][0]
     assert "The controller supplies only the stable task shape" in planner_prompt
@@ -175,7 +194,7 @@ def test_lean_miss_hit_privacy_and_everos_boundary(tmp_path) -> None:
 
     assert hit.hit is True
     assert hit.external_ref == miss.external_ref
-    assert hit.score == 0.91
+    assert hit.score == 1.0
     assert hit.packet == miss.packet
     assert hit.worker_output == "worker-second"
     assert len(planner.calls) == 1
@@ -189,12 +208,14 @@ def test_lean_miss_hit_privacy_and_everos_boundary(tmp_path) -> None:
     add_posts = [payload for path, payload in everos.posts if path == "/api/v2/memory/add"]
     flush_posts = [payload for path, payload in everos.posts if path == "/api/v2/memory/flush"]
     assert len(search_posts) == 2
-    assert len(add_posts) == len(flush_posts) == 1
+    assert len(add_posts) == 1
+    assert flush_posts == []
     assert all(payload["query"] == case_shape for payload in search_posts)
     assert all(payload["method"] == "keyword" for payload in search_posts)
     add_payload = add_posts[0]
-    assert add_payload["external_ref"] == miss.external_ref
-    assert add_payload["messages"][0]["content"] == case_shape
+    assert all(payload["filters"]["session_id"] == add_payload["session_id"] for payload in search_posts)
+    indexed = json.loads(add_payload["messages"][0]["content"])
+    assert indexed == {"schema_version": 1, "case_shape": case_shape, "external_ref": miss.external_ref}
     assert "packet" not in add_payload
     for payload in (*search_posts, *add_posts, *flush_posts):
         serialized = json.dumps(payload, sort_keys=True)

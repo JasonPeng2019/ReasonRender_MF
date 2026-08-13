@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "contextmesh": {
+      "command": "python",
+      "args": ["contextmesh/mcp/server.py"]
+    }
+  }
+}

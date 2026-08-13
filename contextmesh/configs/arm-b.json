@@ -51,6 +51,28 @@
             "input": 0,
             "output": 0
           }
+        },
+        "gpt-oss:20b": {
+          "name": "GPT-OSS 20B (worker fallback)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "nemotron-3-nano:30b": {
+          "name": "Nemotron 3 Nano 30B (worker fallback)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
         }
       }
     }
@@ -64,8 +86,33 @@
       "permission": {
         "edit": "deny"
       },
-      "prompt": "You are the ORCHESTRATOR. Follow the task's cache, planning, source-reading, and acceptance instructions exactly. You may inspect source only when the task says the orchestrator must do so. You never edit source yourself. Split independent implementation slices into ONE worker subagent each with subagent_type=\"worker\"; issue independent task calls in parallel. Give every worker its bounded task, exact write paths, required reads, and acceptance checks. Integrate their reports, verify the requested focused tests or evidence, and report only what was completed and any concrete product defect. Do not invent extra repository reads or a replacement spec when the task provides a cached rendered packet.",
-      "steps": 18
+      "prompt": "You are the ORCHESTRATOR. Finish the supplied task successfully within the fixed 12-turn allowance. Follow its cache, planning, source-reading, and acceptance instructions exactly. You may inspect source only when the task says the orchestrator must do so. You never edit source yourself. Split independent implementation slices into ONE worker subagent each with subagent_type=\"worker\"; launch all four independent task calls in parallel before any edits. The proxy paces upstream starts for the provider limit. Give every worker its bounded task, exact write paths, required reads, and acceptance checks. Integrate their reports, verify the requested focused tests or evidence, and report only what was completed and any concrete product defect. Do not invent extra repository reads or a replacement spec when the task provides a cached rendered packet.",
+      "steps": 12
+    },
+    "title": {
+      "model": "ollama/deepseek-v4-pro"
+    },
+    "recovery_orchestrator": {
+      "mode": "primary",
+      "model": "ollama/deepseek-v4-pro",
+      "temperature": 0,
+      "description": "Continues one failed orchestration slice without replacing the Pro planner.",
+      "permission": {
+        "edit": "deny"
+      },
+      "prompt": "You are the Pro recovery ORCHESTRATOR. Do not edit source. Handle exactly the one bounded slice supplied by the user: inspect only what is necessary, then delegate exactly one cheap subagent_type=worker with the complete task contract, exact write paths, and focused acceptance check. Do not launch an explorer or unrelated workers. Collect the worker result, run or request the focused test, and report completion succinctly.",
+      "steps": 4
+    },
+    "recovery_worker": {
+      "mode": "primary",
+      "model": "ollama/deepseek-v4-flash:preview",
+      "temperature": 0,
+      "description": "Continues one failed worker slice without restarting its parent arm.",
+      "permission": {
+        "edit": "allow"
+      },
+      "prompt": "You are a cheap recovery worker. Implement exactly the supplied bounded slice in the current workspace, add its focused test, run focused tests, and report only changed paths and test results. Do not reread unrelated architecture or spawn subagents.",
+      "steps": 4
     },
     "worker": {
       "mode": "subagent",
@@ -75,8 +122,8 @@
       "permission": {
         "edit": "allow"
       },
-      "prompt": "You are a WORKER implementing exactly one bounded task supplied by the orchestrator. Read only the required source files and the supplied rendered packet before editing. Make the requested production and focused-test changes in the declared write paths. Preserve public contracts and non-goals. Run the smallest relevant validation if available, then report changed paths and the result. Do not spawn subagents, broaden the task, or reread the architecture corpus unless the task explicitly requires it. If ContextMesh returns an authoritative structural digest, use it for the requested cross-reference.",
-      "steps": 14
+      "prompt": "You are a WORKER implementing exactly one bounded task supplied by the orchestrator. Read only the required source files and that task's supplied rendered packet before editing. Make the requested production and focused-test changes in the declared write paths. Preserve public contracts and non-goals. Run the smallest relevant validation if available, then report changed paths and the result. Do not spawn subagents, broaden the task, or reread the architecture corpus unless the task explicitly requires it. If ContextMesh returns an authoritative structural digest, use it for the requested cross-reference. Work directly and finish within four agent steps.",
+      "steps": 4
     }
   },
   "plugin": [

@@ -11,16 +11,16 @@ to skip the expensive SPEC call while using different dynamic slot values.
 The future runtime case index is `app=reasonrender`,
 `project=rrc-template-index`, `user=rrc-runtime`. It is separate from general
 runtime project memory at `project=orchestrator-memory`,
-`user=product-runtime`. The coding orchestrator and Luna use neither space.
+`user=product-runtime`. The coding orchestrator and external DeepSeek workers use neither space.
 
 ## Coding-only execution rule
 
 The coding orchestrator delegates each implementation slice to a fresh
-`luna-xhigh-fast` coding subagent, with exactly one active by default. Every
-packet has a plan, implementation spec, explicit write paths, and at most five
-initial files. Luna reads and edits code, returns a code-result packet, then
-exits. It does not call EverOS, run tests, invoke a model/real subagent, start
-the RRC runner, or write to Snowflake.
+external DeepSeek V4 Flash coding worker, with exactly one active by default.
+Every packet has a plan, implementation spec, explicit write paths, and at
+most five initial files. The worker reads and edits code, returns a code-result
+packet, then exits. It does not call EverOS, run tests, invoke a model/real
+subagent, start the RRC runner, or write to Snowflake.
 
 Coding errors never block the model. Each task returns `done`,
 `done_degraded`, or `ready_for_user_test`; no coding agent reports a confirmed
@@ -173,13 +173,13 @@ real EverOS/model/subagent cost.
 
 ```text
 this orchestrator: packet scheduling and result summaries only
-    -> fresh Luna fast/xhigh: one serial coding slice, then exits
-    -> fresh Luna fast/xhigh: next serial coding slice, then exits
-    -> fresh Luna fast/xhigh: smoke + product-focused review, then exits
-    -> optional fresh Luna fast/xhigh: one live two-task check, then exits
+    -> fresh external DeepSeek worker: one serial coding slice, then exits
+    -> fresh external DeepSeek worker: next serial coding slice, then exits
+    -> fresh external DeepSeek worker: smoke + product-focused review, then exits
+    -> optional fresh external DeepSeek worker: one live two-task check, then exits
 ```
 
-Every worker is `gpt-5.6-luna` with `xhigh` reasoning and priority service.
+Every worker uses the checked-in external DeepSeek V4 Flash profile and launcher.
 There is exactly one active worker because all slices share the task/packet
 contract. The orchestrator does not edit, test, or separately review code.
 
@@ -208,7 +208,7 @@ contract. The orchestrator does not edit, test, or separately review code.
    SQLite, renders `slot_values`, and gives that packet to the worker without a
    new planner/SPEC call. On accepted MISS it stores the generic template and
    indexes `case_shape`.
-4. **Required smoke and review — 10 minutes.** A fresh Luna test worker first
+4. **Required smoke and review — 10 minutes.** A fresh external DeepSeek test worker first
    checks the changed paths against items 1–3, then executes only two
    deterministic smoke checks: capture an EverOS request and prove it contains
    `case_shape` plus `external_ref`, never literal slot values; then seed a
@@ -217,7 +217,7 @@ contract. The orchestrator does not edit, test, or separately review code.
    review; do not add a separate review worker unless it reports one concrete
    ambiguity.
 
-**Optional follow-up test — only if time remains.** One fresh Luna fast/xhigh
+**Optional follow-up test — only if time remains.** One fresh external DeepSeek
 test worker runs exactly one live two-task path: first task MISS -> planner
 packet -> accepted generic template -> SQLite + EverOS; second task has the
 same `case_shape` and different `slot_values` -> EverOS ref -> SQLite template

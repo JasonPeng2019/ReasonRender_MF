@@ -1,4 +1,35 @@
-# ContextMesh — subagent token optimization for opencode, powered by EverOS
+# ContextMesh — CLI validation runtime, with an archived OpenCode demo
+
+> **Active FULL-fix runtime (2026-08-10).** The measured harness uses the
+> locally authenticated Codex and Claude CLIs. ContextMesh's Python MCP server
+> calls a bounded, standard-tier Claude CLI digest child and stores assistant-only
+> exact-key buffers in a local EverOS process. It uses no Ollama credential or
+> Tollgate proxy. On Windows, EverOS runs through WSL because EverOS requires
+> Linux's `fcntl` lock implementation; its data root remains under this checkout.
+
+## Active quickstart
+
+```powershell
+# .env.local is local-only and contains non-secret CLI settings.
+Get-Content contextmesh/.env.local
+
+# Start local EverOS through WSL from this checkout.
+wsl.exe bash -lc "cd /mnt/c/Users/Jason/Documents/Jason/ReasonRender-real && bash contextmesh/scripts/start_stack.sh"
+
+# Prove the assistant-only exact-key path.
+wsl.exe bash -lc "cd /mnt/c/Users/Jason/Documents/Jason/ReasonRender-real && python3 contextmesh/scripts/smoke_everos.py"
+
+# Run the current CLI harness only after its normal provider opt-in.
+$env:REASONRENDER_ALLOW_PROVIDER_EXECUTION = '1'
+python -m harness.runner round live --execute
+```
+
+The launcher gives EverOS an unreachable local placeholder only to satisfy its
+eager client construction. ContextMesh writes assistant-only buffers, which
+EverOS parks without making an LLM request; the actual digest provider is the
+Claude CLI configured in `.env.local`.
+
+## Archived OpenCode/Tollgate demo (not the active workflow)
 
 Side-by-side demo system: **Arm A** runs stock opencode on a fan-out task and pays
 full price for every sibling subagent re-reading the same files. **Arm B** runs the
@@ -43,7 +74,7 @@ contextmesh/
   runs/                     per-run artifacts (gitignored)
 ```
 
-## Quickstart
+## Archived quickstart
 
 ```bash
 # 0. prerequisites: bun, uv, python3; submodules checked out; deps installed:
@@ -167,7 +198,7 @@ press Enter on both. The live meter reads the current round only (from
 4. Load Snowflake (`snowflake/load.py`) and chart `V_ARM_COMPARISON` /
    `V_METER_CROSSCHECK` in a Streamlit-in-Snowflake worksheet.
 
-## Switching models/providers
+## Archived provider switching
 
 Everything is env/config driven: `CONTEXTMESH_MODEL` + `OLLAMA_API_KEY` in
 `.env.local`, provider block in `configs/arm-*.json`, `--model` on the harness.

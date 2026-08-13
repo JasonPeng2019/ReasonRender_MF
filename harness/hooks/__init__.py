@@ -1,0 +1,1 @@
+"""Completion-gate hook support."""

@@ -33,7 +33,20 @@ class SQLiteTemplateStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stage_plan_states (
+                stage_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+            """
+        )
         self._connection.commit()
+
+    def close(self) -> None:
+        """Release the SQLite file handle after a one-shot cache lookup."""
+
+        self._connection.close()
 
     def put(self, template: Template) -> None:
         """Upsert one generic template by its external reference."""
@@ -125,6 +138,36 @@ class SQLiteTemplateStore:
             estimated_implementation_tokens=payload["estimated_implementation_tokens"],
             packet_token_budget=payload["packet_token_budget"],
         )
+
+    def put_stage_plan_state(self, stage_key: str, payload: Mapping[str, object]) -> None:
+        """Persist source-free RRC state for one rendered workflow stage."""
+
+        if not isinstance(stage_key, str) or not stage_key:
+            raise ValueError("stage_key must be a non-empty string")
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO stage_plan_states (stage_key, payload)
+                VALUES (?, ?)
+                ON CONFLICT(stage_key) DO UPDATE SET payload = excluded.payload
+                """,
+                (stage_key, encoded),
+            )
+
+    def get_stage_plan_state(self, stage_key: str) -> dict[str, object] | None:
+        """Return one source-free RRC stage record, or ``None`` on a miss."""
+
+        row = self._connection.execute(
+            "SELECT payload FROM stage_plan_states WHERE stage_key = ?", (stage_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return dict(payload) if isinstance(payload, Mapping) else None
 
 
 def _spec_payload(specification: Spec) -> dict[str, object]:
